@@ -1,0 +1,118 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>GoTunnel</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div class="container">
+        <header class="header">
+            <div class="header-content">
+                <h1>GoTunnel</h1>
+                <div style="display: flex; align-items: center; gap: 1rem;">
+                    <div class="status-badge" id="serverStatus">
+                        <span class="status-indicator"></span>
+                        Server Online
+                    </div>
+                    <button class="btn btn-secondary" onclick="window.app.logout()" style="padding: 0.5rem 1rem; font-size: 0.85rem;">Logout</button>
+                </div>
+            </div>
+        </header>
+
+        <main class="main">
+            <section class="stats-grid">
+                <div class="stat-card">
+                    <div class="stat-label">Connected Clients</div>
+                    <div class="stat-value" id="clientCount">0</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-label">Active Tunnels</div>
+                    <div class="stat-value" id="tunnelCount">0</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-label">Active Streams</div>
+                    <div class="stat-value" id="streamCount">0</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-label">Server Port</div>
+                    <div class="stat-value" id="serverPort">7727</div>
+                </div>
+            </section>
+
+            <section class="clients-section">
+                <h2>Connected Clients</h2>
+                <div id="clientsList" class="clients-list">
+                    <div class="empty-state">No clients connected</div>
+                </div>
+            </section>
+
+            <!-- Edit Modal -->
+            <div id="editModal" class="modal">
+                <div class="modal-content">
+                    <div class="modal-header">
+                        <h2>Edit Client: <span id="editClientName">--</span></h2>
+                        <button class="modal-close" id="closeModal">&times;</button>
+                    </div>
+                    <div class="modal-body">
+                        <div class="tunnels-editor">
+                            <h3>Current Tunnels</h3>
+                            <div id="editTunnelsList" class="edit-tunnels-list">
+                                <div class="empty-state">No tunnels</div>
+                            </div>
+
+                            <h3 style="margin-top: 2rem;">Add New Tunnel</h3>
+                            <div class="add-tunnel-form">
+                                <div class="form-group">
+                                    <label for="remotePort">Server Port <span style="font-size: 0.8rem; color: var(--secondary);">(public)</span></label>
+                                    <input type="number" id="remotePort" placeholder="e.g., 8001" min="1" max="65535">
+                                </div>
+                                <div class="form-group">
+                                    <label for="localPort">Service Port <span style="font-size: 0.8rem; color: var(--secondary);">(client's private)</span></label>
+                                    <input type="number" id="localPort" placeholder="e.g., 3000" min="1" max="65535">
+                                </div>
+                                <button id="addTunnelBtn" class="btn btn-primary">Add Tunnel</button>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="modal-footer">
+                        <button class="btn btn-secondary" id="cancelBtn">Close</button>
+                    </div>
+                </div>
+            </div>
+
+            <section class="tunnels-section">
+                <h2>Tunnel Mappings</h2>
+                <div id="tunnelsList" class="tunnels-list">
+                    <div class="empty-state">No tunnels configured</div>
+                </div>
+            </section>
+
+            <section class="logs-section">
+                <div class="logs-header">
+                    <h2>Server Logs</h2>
+                    <div class="logs-controls">
+                        <select id="logLevel" class="log-filter">
+                            <option value="">All Levels</option>
+                            <option value="INFO">Info</option>
+                            <option value="WARNING">Warning</option>
+                            <option value="ERROR">Error</option>
+                        </select>
+                        <button id="clearLogsBtn" class="btn btn-small">Clear Logs</button>
+                    </div>
+                </div>
+                <div id="logsList" class="logs-list">
+                    <div class="empty-state">No logs available</div>
+                </div>
+            </section>
+        </main>
+
+        <footer class="footer">
+            <p>GoTunnel &copy; 2026 | Last updated: <span id="lastUpdate">--:--:--</span></p>
+        </footer>
+    </div>
+
+    <script src="app.js"></script>
+</body>
+</html>
