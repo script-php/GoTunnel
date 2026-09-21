@@ -1,3 +1,4 @@
 gotunnel
 config.json
 gotunnel.log
+*.zip

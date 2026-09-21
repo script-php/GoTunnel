@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/yoyo/gotunnel/internal/config"
 	"github.com/yoyo/gotunnel/internal/protocol"
 	"github.com/yoyo/gotunnel/internal/tunnel"
 )
@@ -63,7 +64,7 @@ func NewClient(serverAddr, machineID, password string) *Client {
 
 // Start starts the client and connects to server
 func (c *Client) Start() error {
-	log.Printf("GoTunnel Client v1.0.0")
+	log.Printf("GoTunnel Client %s", config.Version)
 	log.Printf("Connecting to: %s", c.serverAddr)
 	log.Printf("Machine ID: %s", c.machineID)
 

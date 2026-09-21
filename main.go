@@ -16,8 +16,6 @@ import (
 	"github.com/yoyo/gotunnel/internal/server"
 )
 
-const version = "1.0.0"
-
 func main() {
 	if len(os.Args) < 2 {
 		printUsage()
@@ -45,7 +43,7 @@ func isRoot() bool {
 }
 
 func printUsage() {
-	fmt.Printf(`GoTunnel v%s - Self-hosted reverse TCP tunneling
+	fmt.Printf(`GoTunnel %s - Self-hosted reverse TCP tunneling
 
 USAGE:
   gotunnel <command> [options]
@@ -65,7 +63,7 @@ EXAMPLES:
 For detailed help on a command:
   gotunnel server -help
   gotunnel client -help
-`, version)
+`, config.Version)
 }
 
 // registerService creates a systemd service file for the given command
