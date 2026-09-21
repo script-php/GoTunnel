@@ -21,7 +21,6 @@ const (
 	ReadTimeoutDuration   = 20 * time.Second
 	WriteTimeoutDuration  = 20 * time.Second
 	StreamTimeoutDuration = 60 * time.Second
-	StreamIdleTimeout     = 5 * time.Minute // Close idle streams
 	KeepaliveInterval     = 10 * time.Second
 	PongTimeoutThreshold  = 3 // Allow 3 missed PONGs before closing
 )
@@ -33,11 +32,9 @@ type ClientConnection struct {
 	MachineID string
 
 	// Streams
-	streams        map[uint32]*tunnel.Stream
-	streamsMu      sync.RWMutex
-	streamActivity map[uint32]time.Time // Track last activity per stream
-	activityMu     sync.RWMutex
-	nextStreamID   uint32
+	streams      map[uint32]*tunnel.Stream
+	streamsMu    sync.RWMutex
+	nextStreamID uint32
 
 	// Keepalive tracking
 	lastPongTime int64 // Timestamp of last PONG received
@@ -51,11 +48,10 @@ type ClientConnection struct {
 // NewClientConnection creates a new client connection handler
 func NewClientConnection(conn net.Conn, server *Server) *ClientConnection {
 	return &ClientConnection{
-		conn:           conn,
-		server:         server,
-		streams:        make(map[uint32]*tunnel.Stream),
-		streamActivity: make(map[uint32]time.Time),
-		lastPongTime:   time.Now().Unix(),
+		conn:         conn,
+		server:       server,
+		streams:      make(map[uint32]*tunnel.Stream),
+		lastPongTime: time.Now().Unix(),
 	}
 }
 
@@ -165,10 +161,6 @@ func (cc *ClientConnection) Handle() {
 	ticker := time.NewTicker(KeepaliveInterval)
 	defer ticker.Stop()
 
-	// Idle stream cleanup ticker
-	idleTicker := time.NewTicker(30 * time.Second)
-	defer idleTicker.Stop()
-
 	// Set read/write deadlines for the connection
 	cc.conn.SetReadDeadline(time.Now().Add(ReadTimeoutDuration))
 	cc.conn.SetWriteDeadline(time.Now().Add(WriteTimeoutDuration))
@@ -230,32 +222,6 @@ func (cc *ClientConnection) Handle() {
 			log.Printf("Sent PING to client: %s", cc.MachineID)
 			if cc.server.logger != nil {
 				cc.server.logger.Add("INFO", fmt.Sprintf("Sent PING to client: %s", cc.MachineID))
-			}
-
-		case <-idleTicker.C:
-			// Check for idle streams and close them
-			cc.activityMu.RLock()
-			now := time.Now()
-			idleStreams := []uint32{}
-			for streamID, lastActivity := range cc.streamActivity {
-				if now.Sub(lastActivity) > StreamIdleTimeout {
-					idleStreams = append(idleStreams, streamID)
-				}
-			}
-			cc.activityMu.RUnlock()
-
-			// Close idle streams
-			for _, streamID := range idleStreams {
-				log.Printf("Closing idle stream %d for client %s", streamID, cc.MachineID)
-				msg := &protocol.Message{
-					Type: protocol.MessageTypeStreamClose,
-					Payload: protocol.MessageStreamClose{
-						StreamID: streamID,
-						Reason:   "idle timeout",
-					},
-				}
-				cc.sendMessage(msg)
-				cc.closeStream(streamID)
 			}
 
 		case err := <-errCh:
@@ -481,8 +447,8 @@ func (cc *ClientConnection) forwardExternalToClient(streamID uint32) {
 
 	// Set both read and write deadlines to detect stalled connections
 	// Read timeout is 10 minutes (slow clients allowed, but detect hangs)
-	stream.Conn1.SetReadDeadline(time.Now().Add(10 * time.Minute))
-	stream.Conn1.SetWriteDeadline(time.Now().Add(StreamTimeoutDuration))
+	// stream.Conn1.SetReadDeadline(time.Now().Add(1 * time.Minute))
+	// stream.Conn1.SetWriteDeadline(time.Now().Add(StreamTimeoutDuration))
 
 	buf := make([]byte, 32*1024)
 	for {
@@ -494,6 +460,11 @@ func (cc *ClientConnection) forwardExternalToClient(streamID uint32) {
 			return
 		}
 		stream.Mu.Unlock()
+
+		// Refresh deadlines BEFORE each read to keep timeout active-based (not absolute)
+		// This prevents timeout for continuous streams (audio, video) with buffering or silence periods
+		// stream.Conn1.SetReadDeadline(time.Now().Add(10 * time.Minute))
+		// stream.Conn1.SetWriteDeadline(time.Now().Add(StreamTimeoutDuration))
 
 		n, err := stream.Conn1.Read(buf)
 		if err != nil {
@@ -520,14 +491,6 @@ func (cc *ClientConnection) forwardExternalToClient(streamID uint32) {
 		}
 
 		if n > 0 {
-			// Update activity tracking
-			cc.activityMu.Lock()
-			cc.streamActivity[streamID] = time.Now()
-			cc.activityMu.Unlock()
-
-			// Refresh deadlines after each successful read
-			stream.Conn1.SetReadDeadline(time.Now().Add(10 * time.Minute))
-			stream.Conn1.SetWriteDeadline(time.Now().Add(StreamTimeoutDuration))
 			dataMsg := &protocol.Message{
 				Type: protocol.MessageTypeStreamData,
 				Payload: protocol.MessageStreamData{
@@ -575,11 +538,6 @@ func (cc *ClientConnection) handleStreamData(payload protocol.MessageStreamData)
 		return
 	}
 
-	// Update activity tracking
-	cc.activityMu.Lock()
-	cc.streamActivity[payload.StreamID] = time.Now()
-	cc.activityMu.Unlock()
-
 	// Write data to the connection with timeout to prevent hangs
 	// Keep lock held during write to prevent concurrent close
 	stream.Conn1.SetWriteDeadline(time.Now().Add(StreamTimeoutDuration))
@@ -607,10 +565,6 @@ func (cc *ClientConnection) closeStream(streamID uint32) {
 		delete(cc.streams, streamID)
 	}
 	cc.streamsMu.Unlock()
-
-	cc.activityMu.Lock()
-	delete(cc.streamActivity, streamID)
-	cc.activityMu.Unlock()
 
 	if exists && stream != nil {
 		stream.Close()
@@ -683,11 +637,6 @@ func (cc *ClientConnection) Close() error {
 		stream.Close()
 	}
 	cc.streamsMu.Unlock()
-
-	// Clear activity tracking
-	cc.activityMu.Lock()
-	cc.streamActivity = make(map[uint32]time.Time)
-	cc.activityMu.Unlock()
 
 	// Close connection
 	return cc.conn.Close()

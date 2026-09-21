@@ -19,7 +19,6 @@ const (
 	ReadTimeoutDuration     = 20 * time.Second
 	WriteTimeoutDuration    = 20 * time.Second
 	StreamTimeoutDuration   = 60 * time.Second
-	StreamIdleTimeout       = 5 * time.Minute // Close idle streams after 5 minutes
 	KeepaliveInterval       = 10 * time.Second
 	MaxConcurrentLocalConns = 50 // Prevent file descriptor exhaustion
 	MaxStreamsPerClient     = 100
@@ -35,10 +34,8 @@ type Client struct {
 	conn net.Conn
 
 	// Streams
-	streams        map[uint32]*tunnel.Stream
-	streamsMu      sync.RWMutex
-	streamActivity map[uint32]time.Time // Track last activity per stream
-	activityMu     sync.RWMutex
+	streams   map[uint32]*tunnel.Stream
+	streamsMu sync.RWMutex
 
 	// Tunnels
 	tunnels   []protocol.TunnelMap
@@ -59,7 +56,6 @@ func NewClient(serverAddr, machineID, password string) *Client {
 		password:          password,
 		reconnectInterval: 5 * time.Second,
 		streams:           make(map[uint32]*tunnel.Stream),
-		streamActivity:    make(map[uint32]time.Time),
 		stopCh:            make(chan struct{}),
 		doneCh:            make(chan struct{}),
 	}
@@ -220,10 +216,6 @@ func (c *Client) handleMessages() {
 	ticker := time.NewTicker(KeepaliveInterval)
 	defer ticker.Stop()
 
-	// Idle stream cleanup ticker
-	idleTicker := time.NewTicker(30 * time.Second)
-	defer idleTicker.Stop()
-
 	// Set read/write deadlines for the connection
 	if c.conn != nil {
 		c.conn.SetReadDeadline(time.Now().Add(ReadTimeoutDuration))
@@ -266,32 +258,6 @@ func (c *Client) handleMessages() {
 			if c.conn != nil {
 				c.conn.SetReadDeadline(time.Now().Add(ReadTimeoutDuration))
 				c.conn.SetWriteDeadline(time.Now().Add(WriteTimeoutDuration))
-			}
-
-		case <-idleTicker.C:
-			// Check for idle streams and close them
-			c.activityMu.RLock()
-			now := time.Now()
-			idleStreams := []uint32{}
-			for streamID, lastActivity := range c.streamActivity {
-				if now.Sub(lastActivity) > StreamIdleTimeout {
-					idleStreams = append(idleStreams, streamID)
-				}
-			}
-			c.activityMu.RUnlock()
-
-			// Close idle streams
-			for _, streamID := range idleStreams {
-				log.Printf("Closing idle stream %d", streamID)
-				msg := &protocol.Message{
-					Type: protocol.MessageTypeStreamClose,
-					Payload: protocol.MessageStreamClose{
-						StreamID: streamID,
-						Reason:   "idle timeout",
-					},
-				}
-				c.sendMessage(msg)
-				c.closeStream(streamID)
 			}
 
 		case err := <-errCh:
@@ -421,11 +387,6 @@ func (c *Client) handleStreamOpen(payload protocol.MessageStreamOpen) {
 	c.streams[streamID] = stream
 	c.streamsMu.Unlock()
 
-	// Track stream activity
-	c.activityMu.Lock()
-	c.streamActivity[streamID] = time.Now()
-	c.activityMu.Unlock()
-
 	// Only set write deadline to prevent hangs on sends
 	// Don't set read deadline - local service may send data slowly
 	localConn.SetWriteDeadline(time.Now().Add(StreamTimeoutDuration))
@@ -445,9 +406,6 @@ func (c *Client) handleStreamOpen(payload protocol.MessageStreamOpen) {
 		c.streamsMu.Lock()
 		delete(c.streams, streamID)
 		c.streamsMu.Unlock()
-		c.activityMu.Lock()
-		delete(c.streamActivity, streamID)
-		c.activityMu.Unlock()
 		return
 	}
 
@@ -515,10 +473,6 @@ func (c *Client) handleStreamData(streamID uint32, stream *tunnel.Stream) {
 			}
 
 			if n > 0 {
-				// UPDATE ACTIVITY - FIX #1: Track activity when reading from local
-				c.activityMu.Lock()
-				c.streamActivity[streamID] = time.Now()
-				c.activityMu.Unlock()
 
 				// Refresh write deadline after each successful read
 				stream.Conn1.SetWriteDeadline(time.Now().Add(StreamTimeoutDuration))
@@ -578,11 +532,6 @@ func (c *Client) handleIncomingStreamData(payload protocol.MessageStreamData) {
 		return
 	}
 
-	// Update activity
-	c.activityMu.Lock()
-	c.streamActivity[payload.StreamID] = time.Now()
-	c.activityMu.Unlock()
-
 	// Write data to localhost connection with timeout to prevent hangs
 	// Keep lock held during write to prevent concurrent close
 	stream.Conn1.SetWriteDeadline(time.Now().Add(StreamTimeoutDuration))
@@ -607,10 +556,6 @@ func (c *Client) closeStream(streamID uint32) {
 		delete(c.streams, streamID)
 	}
 	c.streamsMu.Unlock()
-
-	c.activityMu.Lock()
-	delete(c.streamActivity, streamID)
-	c.activityMu.Unlock()
 
 	if exists && stream != nil {
 		stream.Close()
@@ -690,10 +635,6 @@ func (c *Client) closeConnection() {
 	c.streams = make(map[uint32]*tunnel.Stream)
 	c.streamsMu.Unlock()
 
-	// Clear activity tracking
-	c.activityMu.Lock()
-	c.streamActivity = make(map[uint32]time.Time)
-	c.activityMu.Unlock()
 }
 
 // IsConnected returns whether the client is connected
