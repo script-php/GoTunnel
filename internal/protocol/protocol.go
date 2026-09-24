@@ -5,7 +5,28 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"io"
 )
+
+const MaxMessageSize = 10 * 1024 * 1024
+
+// Read reads one bounded frame, validating its length before allocating payload memory.
+func Read(r io.Reader) (*Message, error) {
+	var header [5]byte
+	if _, err := io.ReadFull(r, header[:]); err != nil {
+		return nil, err
+	}
+	length := binary.BigEndian.Uint32(header[1:])
+	if length > MaxMessageSize {
+		return nil, fmt.Errorf("message size %d exceeds maximum %d", length, MaxMessageSize)
+	}
+	frame := make([]byte, 5+int(length))
+	copy(frame, header[:])
+	if _, err := io.ReadFull(r, frame[5:]); err != nil {
+		return nil, err
+	}
+	return Decode(frame)
+}
 
 // MessageType represents the type of message
 type MessageType byte
@@ -153,7 +174,6 @@ func Decode(data []byte) (*Message, error) {
 	}
 
 	// Enforce maximum message size (10MB) to prevent DoS attacks
-	const MaxMessageSize = 10 * 1024 * 1024
 	if length > MaxMessageSize {
 		return nil, fmt.Errorf("message size %d exceeds maximum %d", length, MaxMessageSize)
 	}

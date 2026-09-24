@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/yoyo/gotunnel/internal/client"
 	"github.com/yoyo/gotunnel/internal/config"
@@ -299,10 +300,9 @@ func runClient() {
 	server := fs.String("server", "", "Server address (host:port)")
 	pass := fs.String("pass", "", "Server password")
 	name := fs.String("name", "", "Machine name/identity")
-	_ = fs.String("id-file", "", "Machine ID file") // TODO: implement machine ID file
 	debug := fs.Bool("debug", false, "Enable debug logging")
 	verbose := fs.Bool("verbose", false, "Enable verbose output")
-	_ = fs.Int("reconnect-interval", 5, "Reconnect interval in seconds") // TODO: override client reconnect interval
+	reconnectInterval := fs.Int("reconnect-interval", 5, "Reconnect interval in seconds")
 	register := fs.Bool("register", false, "Register as systemd service")
 	unregister := fs.Bool("unregister", false, "Unregister systemd service")
 	help := fs.Bool("help", false, "Show help message")
@@ -317,8 +317,7 @@ OPTIONS:
   -server string             Server address (required, e.g., example.com:7727)
   -pass string               Server password (required for normal operation)
   -name string               Machine name/identity (required for normal operation)
-  -id-file string            Machine ID file path (default: ~/.gotunnel/machine-id)
-  -debug                     Enable debug logging
+	  -debug                     Enable debug logging
   -verbose                   Enable verbose output
   -reconnect-interval int    Reconnect interval in seconds (default 5)
   -register                  Register as systemd service with current options (requires root)
@@ -377,6 +376,9 @@ EXAMPLES:
 
 	// Create client
 	cli := client.NewClient(*server, *name, *pass)
+	if err := cli.SetReconnectInterval(time.Duration(*reconnectInterval) * time.Second); err != nil {
+		log.Fatalf("Invalid reconnect interval: %v", err)
+	}
 
 	// Start client
 	if err := cli.Start(); err != nil {

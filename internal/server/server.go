@@ -2,12 +2,13 @@ package server
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"net"
-	"strings"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/yoyo/gotunnel/internal/auth"
 	"github.com/yoyo/gotunnel/internal/config"
@@ -19,6 +20,8 @@ const (
 	MaxBufferedMessagesPerStream = 50               // Maximum pending messages in send buffer
 	MaxMessageSize               = 10 * 1024 * 1024 // 10MB max message size
 	StreamSendBufferSize         = 32 * 1024        // 32KB per stream send buffer
+	AuthenticationTimeout        = 10 * time.Second
+	MaxPendingAuthentications    = 64
 )
 
 // Server handles the tunnel server logic
@@ -38,6 +41,7 @@ type Server struct {
 	// Connection tracking
 	connCount   int32 // Total active connections
 	connCountMu sync.Mutex
+	pendingAuth chan struct{}
 
 	// Listener for client connections
 	listener net.Listener
@@ -66,6 +70,7 @@ func NewServer(cfgMgr *config.Manager) *Server {
 		clients:         make(map[string]*ClientConnection),
 		portMap:         make(map[int]string),
 		tunnelListeners: make(map[int]net.Listener),
+		pendingAuth:     make(chan struct{}, MaxPendingAuthentications),
 		stopCh:          make(chan struct{}),
 		doneCh:          make(chan struct{}),
 	}
@@ -86,7 +91,7 @@ func (s *Server) SetLogger(logger LoggerInterface) {
 
 // logEvent logs a message to both standard logger and web server logger
 func (s *Server) logEvent(level, message string) {
-	log.Printf(message)
+	log.Print(message)
 	if s.logger != nil {
 		s.logger.Add(level, message)
 	}
@@ -188,8 +193,16 @@ func (s *Server) acceptClients() {
 			continue
 		}
 
-		// Handle client connection in goroutine
-		go s.handleClientConnection(conn)
+		select {
+		case s.pendingAuth <- struct{}{}:
+			go func() {
+				defer func() { <-s.pendingAuth }()
+				s.handleClientConnection(conn)
+			}()
+		default:
+			s.logEvent("WARNING", "Rejected client connection: too many pending authentications")
+			conn.Close()
+		}
 	}
 }
 
@@ -199,10 +212,18 @@ func (s *Server) handleClientConnection(conn net.Conn) {
 	if tcpConn, ok := conn.(*net.TCPConn); ok {
 		tcpConn.SetLinger(0)
 	}
+	if err := conn.SetDeadline(time.Now().Add(AuthenticationTimeout)); err != nil {
+		conn.Close()
+		return
+	}
 
 	clientConn := NewClientConnection(conn, s)
 	if err := clientConn.Authenticate(); err != nil {
 		s.logEvent("WARNING", fmt.Sprintf("Client authentication failed: %v", err))
+		conn.Close()
+		return
+	}
+	if err := conn.SetDeadline(time.Time{}); err != nil {
 		conn.Close()
 		return
 	}
@@ -228,8 +249,13 @@ func (s *Server) handleClientConnection(conn net.Conn) {
 }
 
 // RemoveClient removes a disconnected client and cleans up resources
-func (s *Server) RemoveClient(machineID string) {
+func (s *Server) RemoveClient(client *ClientConnection) {
+	machineID := client.MachineID
 	s.clientsMu.Lock()
+	if s.clients[machineID] != client {
+		s.clientsMu.Unlock()
+		return
+	}
 	delete(s.clients, machineID)
 	s.clientsMu.Unlock()
 
@@ -318,14 +344,17 @@ func (s *Server) acceptTunnelConnections(port int, listener net.Listener) {
 
 		conn, err := listener.Accept()
 		if err != nil {
+			if errors.Is(err, net.ErrClosed) || s.isShuttingDown() {
+				return
+			}
+			log.Printf("Error accepting connection on port %d: %v", port, err)
+			// Resource exhaustion may recover; avoid a busy loop while retrying.
+			timer := time.NewTimer(time.Second)
 			select {
 			case <-s.stopCh:
+				timer.Stop()
 				return
-			default:
-				// Suppress "use of closed network connection" errors during shutdown
-				if !s.isShuttingDown() || !strings.Contains(err.Error(), "use of closed network connection") {
-					log.Printf("Error accepting connection on port %d: %v", port, err)
-				}
+			case <-timer.C:
 			}
 			continue
 		}

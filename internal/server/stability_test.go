@@ -1,0 +1,68 @@
+package server
+
+import (
+	"github.com/yoyo/gotunnel/internal/protocol"
+	"github.com/yoyo/gotunnel/internal/tunnel"
+	"net"
+	"testing"
+	"time"
+)
+
+func TestStreamWriteFailureDoesNotDeadlock(t *testing.T) {
+	local, peer := net.Pipe()
+	defer local.Close()
+	peer.Close()
+	stream := tunnel.NewStream(1, local, nil)
+	c := &ClientConnection{streams: map[uint32]*tunnel.Stream{1: stream}}
+	done := make(chan struct{})
+	go func() {
+		c.handleStreamData(protocol.MessageStreamData{StreamID: 1, Data: []byte("hello")})
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("write failure deadlocked cleanup")
+	}
+	if !stream.IsClosed() {
+		t.Fatal("failed stream remains open")
+	}
+	if len(c.streams) != 0 {
+		t.Fatal("failed stream remains registered")
+	}
+}
+
+func TestOldClientCleanupPreservesReplacement(t *testing.T) {
+	old := &ClientConnection{MachineID: "machine"}
+	replacement := &ClientConnection{MachineID: "machine"}
+	s := &Server{clients: map[string]*ClientConnection{"machine": replacement}}
+	s.RemoveClient(old)
+	if s.GetClientConnection("machine") != replacement {
+		t.Fatal("old connection removed its replacement")
+	}
+	s.RemoveClient(replacement)
+	if s.GetClientConnection("machine") != nil {
+		t.Fatal("current connection was not removed")
+	}
+}
+
+type closedListener struct{ calls int }
+
+func (l *closedListener) Accept() (net.Conn, error) {
+	l.calls++
+	if l.calls > 1 {
+		panic("retried a closed listener")
+	}
+	return nil, net.ErrClosed
+}
+func (*closedListener) Close() error   { return nil }
+func (*closedListener) Addr() net.Addr { return nil }
+
+func TestClosedTunnelListenerExits(t *testing.T) {
+	s := &Server{stopCh: make(chan struct{})}
+	listener := &closedListener{}
+	s.acceptTunnelConnections(1234, listener)
+	if listener.calls != 1 {
+		t.Fatalf("Accept called %d times", listener.calls)
+	}
+}

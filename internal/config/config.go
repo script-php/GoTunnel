@@ -70,11 +70,17 @@ func (m *Manager) Load() error {
 		return fmt.Errorf("failed to read config file: %w", err)
 	}
 
-	cfg := &Config{}
+	cfg := m.getDefaultConfig()
 	if err := json.Unmarshal(data, cfg); err != nil {
 		return fmt.Errorf("failed to parse config file: %w", err)
 	}
 
+	if err := validate(cfg); err != nil {
+		return fmt.Errorf("invalid configuration: %w", err)
+	}
+	if cfg.Machines == nil {
+		cfg.Machines = make(map[string]MachineConfig)
+	}
 	m.cfg = cfg
 	return nil
 }
@@ -132,7 +138,8 @@ func (m *Manager) GetServerConfig() *ServerConfig {
 	if m.cfg == nil {
 		return nil
 	}
-	return &m.cfg.Server
+	server := m.cfg.Server
+	return &server
 }
 
 // SetServerPassword updates the server password
@@ -163,6 +170,7 @@ func (m *Manager) GetMachine(machineID string) *MachineConfig {
 	}
 
 	if machine, exists := m.cfg.Machines[machineID]; exists {
+		machine = cloneMachine(machine)
 		return &machine
 	}
 	return nil
@@ -177,7 +185,16 @@ func (m *Manager) AddOrUpdateMachine(machineID string, machine *MachineConfig) e
 		return fmt.Errorf("configuration not loaded")
 	}
 
-	m.cfg.Machines[machineID] = *machine
+	if machine == nil {
+		return fmt.Errorf("machine configuration is nil")
+	}
+	if machineID == "" {
+		return fmt.Errorf("machine ID cannot be empty")
+	}
+	if err := validateMachine(machineID, *machine, m.cfg.Server, nil); err != nil {
+		return err
+	}
+	m.cfg.Machines[machineID] = cloneMachine(*machine)
 	return m.saveLocked()
 }
 
@@ -192,7 +209,7 @@ func (m *Manager) GetAllMachines() map[string]MachineConfig {
 
 	result := make(map[string]MachineConfig)
 	for k, v := range m.cfg.Machines {
-		result[k] = v
+		result[k] = cloneMachine(v)
 	}
 	return result
 }
@@ -298,6 +315,54 @@ func (m *Manager) SetPanelPort(port int) error {
 	// Only save if using a config file
 	if m.path != "" {
 		return m.saveLocked()
+	}
+	return nil
+}
+
+// cloneMachine prevents callers from mutating configuration outside the manager lock.
+func cloneMachine(machine MachineConfig) MachineConfig {
+	if machine.Tunnels != nil {
+		machine.Tunnels = append([]TunnelConfig{}, machine.Tunnels...)
+	}
+	return machine
+}
+
+func validate(cfg *Config) error {
+	if cfg.Server.Port < 1 || cfg.Server.Port > 65535 {
+		return fmt.Errorf("invalid server port: %d", cfg.Server.Port)
+	}
+	if cfg.Server.PanelPort < 0 || cfg.Server.PanelPort > 65535 {
+		return fmt.Errorf("invalid panel port: %d", cfg.Server.PanelPort)
+	}
+	if cfg.Server.PanelPort == cfg.Server.Port {
+		return fmt.Errorf("server and panel ports must differ")
+	}
+	owners := make(map[int]string)
+	for id, machine := range cfg.Machines {
+		if err := validateMachine(id, machine, cfg.Server, owners); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func validateMachine(id string, machine MachineConfig, server ServerConfig, owners map[int]string) error {
+	if id == "" {
+		return fmt.Errorf("machine ID cannot be empty")
+	}
+	for _, tunnel := range machine.Tunnels {
+		if tunnel.Remote < 1 || tunnel.Remote > 65535 || tunnel.Local < 1 || tunnel.Local > 65535 {
+			return fmt.Errorf("invalid tunnel ports for machine %q", id)
+		}
+		if tunnel.Remote == server.Port || tunnel.Remote == server.PanelPort {
+			return fmt.Errorf("tunnel port %d conflicts with a server port", tunnel.Remote)
+		}
+		if owners != nil {
+			if owner, exists := owners[tunnel.Remote]; exists {
+				return fmt.Errorf("duplicate remote port %d for machines %q and %q", tunnel.Remote, owner, id)
+			}
+			owners[tunnel.Remote] = id
+		}
 	}
 	return nil
 }

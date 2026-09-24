@@ -18,7 +18,7 @@ import (
 
 // Logging constants
 const (
-	LogBatchSize     = 10           // Batch writes after this many entries
+	LogBatchSize     = 10              // Batch writes after this many entries
 	LogFlushInterval = 1 * time.Second // Or after this duration
 )
 
@@ -51,7 +51,7 @@ type Logger struct {
 	entries  []LogEntry
 	maxSize  int
 	filePath string
-	
+
 	// Buffered file writing
 	logCh   chan LogEntry
 	doneCh  chan struct{}
@@ -67,25 +67,25 @@ func NewLogger(logPath string, maxSize int) *Logger {
 		logCh:    make(chan LogEntry, LogBatchSize*2),
 		doneCh:   make(chan struct{}),
 	}
-	
+
 	// Start background writer goroutine if file path is set
 	if logPath != "" {
 		go l.fileWriterLoop()
 	}
-	
+
 	return l
 }
 
 // fileWriterLoop batches log writes to file
 func (l *Logger) fileWriterLoop() {
 	defer close(l.doneCh)
-	
+
 	// Ensure directory exists
 	if l.filePath != "" {
 		dir := filepath.Dir(l.filePath)
 		os.MkdirAll(dir, 0755)
 	}
-	
+
 	// Open file once for appending
 	f, err := os.OpenFile(l.filePath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
@@ -97,12 +97,12 @@ func (l *Logger) fileWriterLoop() {
 			f.Close()
 		}
 	}()
-	
+
 	ticker := time.NewTicker(LogFlushInterval)
 	defer ticker.Stop()
-	
+
 	var batch []LogEntry
-	
+
 	for {
 		select {
 		case entry, ok := <-l.logCh:
@@ -113,9 +113,9 @@ func (l *Logger) fileWriterLoop() {
 				}
 				return
 			}
-			
+
 			batch = append(batch, entry)
-			
+
 			// Flush if batch is full
 			if len(batch) >= LogBatchSize {
 				if f != nil {
@@ -123,7 +123,7 @@ func (l *Logger) fileWriterLoop() {
 				}
 				batch = batch[:0]
 			}
-			
+
 		case <-ticker.C:
 			// Flush on timeout
 			if len(batch) > 0 && f != nil {
@@ -150,7 +150,7 @@ func (l *Logger) Add(level, message string) {
 		Level:     level,
 		Message:   message,
 	}
-	
+
 	// Add to in-memory buffer
 	l.mu.Lock()
 	l.entries = append(l.entries, entry)
@@ -158,7 +158,7 @@ func (l *Logger) Add(level, message string) {
 		l.entries = l.entries[1:]
 	}
 	l.mu.Unlock()
-	
+
 	// Send to file writer if channel exists (non-blocking)
 	if l.filePath != "" {
 		select {
@@ -407,7 +407,7 @@ func (ws *WebServer) Start(s *Server) error {
 
 	go func() {
 		msg := fmt.Sprintf("Web panel listening on http://%s", ws.port)
-		log.Printf(msg)
+		log.Print(msg)
 		ws.logger.Add("INFO", msg)
 		if err := ws.server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Printf("Web server error: %v", err)

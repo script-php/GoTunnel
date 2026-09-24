@@ -1,7 +1,6 @@
 package client
 
 import (
-	"encoding/binary"
 	"fmt"
 	"io"
 	"log"
@@ -60,6 +59,15 @@ func NewClient(serverAddr, machineID, password string) *Client {
 		stopCh:            make(chan struct{}),
 		doneCh:            make(chan struct{}),
 	}
+}
+
+// SetReconnectInterval configures how long the client waits between attempts.
+func (c *Client) SetReconnectInterval(interval time.Duration) error {
+	if interval <= 0 {
+		return fmt.Errorf("reconnect interval must be greater than zero")
+	}
+	c.reconnectInterval = interval
+	return nil
 }
 
 // Start starts the client and connects to server
@@ -121,7 +129,7 @@ func (c *Client) reconnectLoop() {
 
 // connect connects to the server and authenticates
 func (c *Client) connect() error {
-	conn, err := net.Dial("tcp", c.serverAddr)
+	conn, err := net.DialTimeout("tcp", c.serverAddr, ReadTimeoutDuration)
 	if err != nil {
 		return fmt.Errorf("failed to connect to server: %w", err)
 	}
@@ -131,6 +139,10 @@ func (c *Client) connect() error {
 	c.conn = conn
 	c.connected = true
 	c.connMu.Unlock()
+	if err := conn.SetDeadline(time.Now().Add(ReadTimeoutDuration)); err != nil {
+		c.closeConnection()
+		return fmt.Errorf("failed to set authentication deadline: %w", err)
+	}
 
 	// Send authentication message
 	authMsg := &protocol.Message{
@@ -187,6 +199,10 @@ func (c *Client) connect() error {
 		c.connected = false
 		c.connMu.Unlock()
 		return fmt.Errorf("authentication failed: %s", authResponse.Error)
+	}
+	if err := conn.SetDeadline(time.Time{}); err != nil {
+		c.closeConnection()
+		return fmt.Errorf("failed to clear authentication deadline: %w", err)
 	}
 
 	// Store tunnels
@@ -518,29 +534,22 @@ func (c *Client) handleIncomingStreamData(payload protocol.MessageStreamData) {
 		return
 	}
 
-	// Lock stream and keep locked during write - FIX #4: Prevent concurrent close
+	// Snapshot the connection under the lifecycle lock. Closing a net.Conn
+	// concurrently with Write is safe and must be able to interrupt blocked I/O.
 	stream.Mu.Lock()
-	defer stream.Mu.Unlock()
-
-	// FIX #5: Validate stream state before operations
-	if stream.Closed {
+	conn := stream.Conn1
+	closed := stream.Closed
+	stream.Mu.Unlock()
+	if closed || conn == nil {
 		c.closeStream(payload.StreamID)
 		return
 	}
-	if stream.Conn1 == nil {
-		log.Printf("Stream %d connection is nil", payload.StreamID)
-		c.closeStream(payload.StreamID)
-		return
-	}
-
-	// Write data to localhost connection with timeout to prevent hangs
-	// Keep lock held during write to prevent concurrent close
-	stream.Conn1.SetWriteDeadline(time.Now().Add(StreamTimeoutDuration))
-	if _, err := stream.Conn1.Write(payload.Data); err != nil {
+	conn.SetWriteDeadline(time.Now().Add(StreamTimeoutDuration))
+	if _, err := conn.Write(payload.Data); err != nil {
 		log.Printf("Stream %d write error: %v", payload.StreamID, err)
 		c.closeStream(payload.StreamID)
-		return
 	}
+
 }
 
 // handleStreamClose handles server stream close
@@ -565,38 +574,13 @@ func (c *Client) closeStream(streamID uint32) {
 
 // readMessage reads a message from server
 func (c *Client) readMessage() (*protocol.Message, error) {
-	if c.conn == nil {
+	c.connMu.Lock()
+	conn := c.conn
+	c.connMu.Unlock()
+	if conn == nil {
 		return nil, fmt.Errorf("not connected")
 	}
-
-	// Read message type (1 byte)
-	typeBuf := make([]byte, 1)
-	if _, err := io.ReadFull(c.conn, typeBuf); err != nil {
-		return nil, err
-	}
-
-	// Read payload length (4 bytes)
-	lengthBuf := make([]byte, 4)
-	if _, err := io.ReadFull(c.conn, lengthBuf); err != nil {
-		return nil, err
-	}
-
-	length := binary.BigEndian.Uint32(lengthBuf)
-
-	// Read payload
-	var payloadBytes []byte
-	if length > 0 {
-		payloadBytes = make([]byte, length)
-		if _, err := io.ReadFull(c.conn, payloadBytes); err != nil {
-			return nil, err
-		}
-	}
-
-	// Reconstruct message bytes and decode
-	msgBytes := append(typeBuf, lengthBuf...)
-	msgBytes = append(msgBytes, payloadBytes...)
-
-	return protocol.Decode(msgBytes)
+	return protocol.Read(conn)
 }
 
 // sendMessage sends a message to server

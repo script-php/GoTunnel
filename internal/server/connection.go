@@ -1,7 +1,6 @@
 package server
 
 import (
-	"encoding/binary"
 	"fmt"
 	"io"
 	"log"
@@ -149,7 +148,7 @@ func (cc *ClientConnection) SendTunnelConfig() error {
 
 // Handle handles incoming messages from the client
 func (cc *ClientConnection) Handle() {
-	defer cc.server.RemoveClient(cc.MachineID)
+	defer cc.server.RemoveClient(cc)
 
 	// Enable TCP keepalive to detect half-open connections
 	if tcpConn, ok := cc.conn.(*net.TCPConn); ok {
@@ -364,22 +363,28 @@ func (cc *ClientConnection) HandleIncomingConnection(port int, conn net.Conn) {
 		return
 	}
 
-	// Generate stream ID
-	streamID := atomic.AddUint32(&cc.nextStreamID, 1)
-
-	// Check stream limit (DoS protection)
-	cc.streamsMu.RLock()
-	streamCount := len(cc.streams)
-	cc.streamsMu.RUnlock()
-
-	if streamCount >= MaxStreamsPerClient {
-		log.Printf("Stream limit exceeded for client %s: %d streams", cc.MachineID, streamCount)
-		if cc.server.logger != nil {
-			cc.server.logger.Add("WARNING", fmt.Sprintf("Stream limit exceeded for client %s: %d/%d streams", cc.MachineID, streamCount, MaxStreamsPerClient))
-		}
+	// Reserve a stream before advertising it. Hold the lifecycle lock through
+	// insertion so shutdown cannot finish before a new stream is registered.
+	cc.closedMu.Lock()
+	if cc.closed {
+		cc.closedMu.Unlock()
 		conn.Close()
 		return
 	}
+	cc.streamsMu.Lock()
+	if len(cc.streams) >= MaxStreamsPerClient {
+		cc.streamsMu.Unlock()
+		cc.closedMu.Unlock()
+		conn.Close()
+		return
+	}
+	streamID := atomic.AddUint32(&cc.nextStreamID, 1)
+	for streamID == 0 || cc.streams[streamID] != nil {
+		streamID = atomic.AddUint32(&cc.nextStreamID, 1)
+	}
+	cc.streams[streamID] = tunnel.NewStream(streamID, conn, nil)
+	cc.streamsMu.Unlock()
+	cc.closedMu.Unlock()
 
 	// Send STREAM_OPEN message to client
 	msg := &protocol.Message{
@@ -392,14 +397,10 @@ func (cc *ClientConnection) HandleIncomingConnection(port int, conn net.Conn) {
 
 	if err := cc.sendMessage(msg); err != nil {
 		log.Printf("Failed to send STREAM_OPEN: %v", err)
-		conn.Close()
+		cc.closeStream(streamID)
 		return
 	}
 
-	// Create and store the stream
-	cc.streamsMu.Lock()
-	cc.streams[streamID] = tunnel.NewStream(streamID, conn, nil)
-	cc.streamsMu.Unlock()
 
 	log.Printf("Stream %d opened for port %d (local: %d)", streamID, port, localPort)
 	if cc.server.logger != nil {
@@ -523,29 +524,22 @@ func (cc *ClientConnection) handleStreamData(payload protocol.MessageStreamData)
 		return
 	}
 
-	// Lock stream and keep locked during write - FIX #4: Prevent concurrent close
+	// Snapshot the connection under the lifecycle lock. Closing a net.Conn
+	// concurrently with Write is safe and must be able to interrupt blocked I/O.
 	stream.Mu.Lock()
-	defer stream.Mu.Unlock()
+	conn := stream.Conn1
+	closed := stream.Closed
+	stream.Mu.Unlock()
+	if closed || conn == nil {
+		cc.closeStream(payload.StreamID)
+		return
+	}
+	conn.SetWriteDeadline(time.Now().Add(StreamTimeoutDuration))
+	if _, err := conn.Write(payload.Data); err != nil {
+		log.Printf("Stream %d write error: %v", payload.StreamID, err)
+		cc.closeStream(payload.StreamID)
+	}
 
-	// FIX #5: Validate stream state before operations
-	if stream.Closed {
-		cc.closeStream(payload.StreamID)
-		return
-	}
-	if stream.Conn1 == nil {
-		log.Printf("Stream %d connection is nil", payload.StreamID)
-		cc.closeStream(payload.StreamID)
-		return
-	}
-
-	// Write data to the connection with timeout to prevent hangs
-	// Keep lock held during write to prevent concurrent close
-	stream.Conn1.SetWriteDeadline(time.Now().Add(StreamTimeoutDuration))
-	if _, err := stream.Conn1.Write(payload.Data); err != nil {
-		log.Printf("Error writing to stream %d: %v", payload.StreamID, err)
-		cc.closeStream(payload.StreamID)
-		return
-	}
 }
 
 // handleStreamClose handles stream close from client
@@ -573,34 +567,7 @@ func (cc *ClientConnection) closeStream(streamID uint32) {
 
 // readMessage reads a message from the connection
 func (cc *ClientConnection) readMessage() (*protocol.Message, error) {
-	// Read message type (1 byte)
-	typeBuf := make([]byte, 1)
-	if _, err := io.ReadFull(cc.conn, typeBuf); err != nil {
-		return nil, err
-	}
-
-	// Read payload length (4 bytes)
-	lengthBuf := make([]byte, 4)
-	if _, err := io.ReadFull(cc.conn, lengthBuf); err != nil {
-		return nil, err
-	}
-
-	length := binary.BigEndian.Uint32(lengthBuf)
-
-	// Read payload
-	var payloadBytes []byte
-	if length > 0 {
-		payloadBytes = make([]byte, length)
-		if _, err := io.ReadFull(cc.conn, payloadBytes); err != nil {
-			return nil, err
-		}
-	}
-
-	// Reconstruct message bytes and decode
-	msgBytes := append(typeBuf, lengthBuf...)
-	msgBytes = append(msgBytes, payloadBytes...)
-
-	return protocol.Decode(msgBytes)
+	return protocol.Read(cc.conn)
 }
 
 // sendMessage sends a message to the client
