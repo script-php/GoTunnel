@@ -70,6 +70,9 @@ func (cc *ClientConnection) Authenticate() error {
 	if !ok {
 		return fmt.Errorf("invalid auth message payload")
 	}
+	if err := config.ValidateMachineID(authMsg.MachineID); err != nil {
+		return fmt.Errorf("invalid machine ID: %w", err)
+	}
 
 	// Verify password
 	if err := cc.server.authenticator.Authenticate(authMsg.Password); err != nil {
@@ -149,6 +152,7 @@ func (cc *ClientConnection) SendTunnelConfig() error {
 // Handle handles incoming messages from the client
 func (cc *ClientConnection) Handle() {
 	defer cc.server.RemoveClient(cc)
+	defer cc.Close()
 
 	// Enable TCP keepalive to detect half-open connections
 	if tcpConn, ok := cc.conn.(*net.TCPConn); ok {
@@ -166,23 +170,45 @@ func (cc *ClientConnection) Handle() {
 
 	// Message reading goroutine
 	msgCh := make(chan *protocol.Message)
-	errCh := make(chan error)
+	errCh := make(chan error, 1)
+	readerDone := make(chan struct{})
+	readerExited := make(chan struct{})
+	defer func() {
+		close(readerDone)
+		cc.conn.SetReadDeadline(time.Now())
+		<-readerExited
+	}()
 	go func() {
-		defer close(msgCh) // Close channel when reader exits to prevent goroutine leak
+		defer close(readerExited)
 		for {
 			msg, err := cc.readMessage()
 			if err != nil {
-				errCh <- err
+				select {
+				case errCh <- err:
+				case <-readerDone:
+				}
 				return
 			}
-			msgCh <- msg
+			select {
+			case msgCh <- msg:
+			case <-readerDone:
+				return
+			}
 		}
 	}()
 
 	for {
 		select {
 		case <-ticker.C:
-			// Send periodic PING to detect dead connection
+			missedPongs := atomic.LoadInt32(&cc.missedPongs)
+			if missedPongs >= PongTimeoutThreshold {
+				log.Printf("Client %s not responding to PING (missed %d PONGs), closing connection", cc.MachineID, missedPongs)
+				if cc.server.logger != nil {
+					cc.server.logger.Add("ERROR", fmt.Sprintf("Client %s not responding to PING (missed %d PONGs)", cc.MachineID, missedPongs))
+				}
+				return
+			}
+
 			pingMsg := &protocol.Message{
 				Type: protocol.MessageTypePing,
 				Payload: protocol.MessagePing{
@@ -194,30 +220,9 @@ func (cc *ClientConnection) Handle() {
 				if cc.server.logger != nil {
 					cc.server.logger.Add("ERROR", fmt.Sprintf("Failed to send PING to client %s: %v", cc.MachineID, err))
 				}
-				cc.Close()
 				return
 			}
-
-			// Check if we've missed too many PONGs
-			cc.pongMu.Lock()
-			missedPongs := atomic.LoadInt32(&cc.missedPongs)
-			cc.pongMu.Unlock()
-
-			if missedPongs >= PongTimeoutThreshold {
-				log.Printf("Client %s not responding to PING (missed %d PONGs), closing connection", cc.MachineID, missedPongs)
-				if cc.server.logger != nil {
-					cc.server.logger.Add("ERROR", fmt.Sprintf("Client %s not responding to PING (missed %d PONGs)", cc.MachineID, missedPongs))
-				}
-				cc.Close()
-				return
-			}
-
-			// Increment missed pongs counter
 			atomic.AddInt32(&cc.missedPongs, 1)
-
-			// Refresh read/write deadlines after each PING
-			cc.conn.SetReadDeadline(time.Now().Add(ReadTimeoutDuration))
-			cc.conn.SetWriteDeadline(time.Now().Add(WriteTimeoutDuration))
 			log.Printf("Sent PING to client: %s", cc.MachineID)
 			if cc.server.logger != nil {
 				cc.server.logger.Add("INFO", fmt.Sprintf("Sent PING to client: %s", cc.MachineID))
@@ -234,13 +239,8 @@ func (cc *ClientConnection) Handle() {
 			cc.Close()
 			return
 
-		case msg, ok := <-msgCh:
-			if !ok {
-				// msgCh closed, reader goroutine exited
-				cc.Close()
-				return
-			}
-
+		case msg := <-msgCh:
+			cc.conn.SetReadDeadline(time.Now().Add(ReadTimeoutDuration))
 			switch msg.Type {
 			case protocol.MessageTypeStreamReady:
 				payload, ok := msg.Payload.(protocol.MessageStreamReady)
@@ -266,27 +266,13 @@ func (cc *ClientConnection) Handle() {
 					continue
 				}
 
-				stream.Mu.Lock()
-				if stream.Closed {
-					stream.Mu.Unlock()
-					log.Printf("Stream %d READY received but stream already closed", payload.StreamID)
-					continue
-				}
-
-				// Signal readiness to forwardExternalToClient goroutine
-				// Use select with default to prevent double-close panic
-				select {
-				case <-stream.ReadyCh:
-					// Already signaled (shouldn't happen but be safe)
-					stream.Mu.Unlock()
-					log.Printf("Stream %d already had READY signal", payload.StreamID)
-				default:
-					close(stream.ReadyCh)
-					stream.Mu.Unlock()
+				if stream.SignalReady() {
 					log.Printf("Stream %d ready", payload.StreamID)
 					if cc.server.logger != nil {
 						cc.server.logger.Add("INFO", fmt.Sprintf("Stream %d ready", payload.StreamID))
 					}
+				} else {
+					log.Printf("Stream %d READY received after stream was closed or ready", payload.StreamID)
 				}
 
 			case protocol.MessageTypeStreamData:
@@ -380,9 +366,19 @@ func (cc *ClientConnection) HandleIncomingConnection(port int, conn net.Conn) {
 	for streamID == 0 || cc.streams[streamID] != nil {
 		streamID = atomic.AddUint32(&cc.nextStreamID, 1)
 	}
-	cc.streams[streamID] = tunnel.NewStream(streamID, conn, nil)
+	stream := tunnel.NewStream(streamID, conn, nil)
+	cc.streams[streamID] = stream
 	cc.streamsMu.Unlock()
 	cc.closedMu.Unlock()
+	stream.StartWriter(StreamTimeoutDuration, func(err error) {
+		log.Printf("Stream %d external write error: %v", streamID, err)
+		cc.sendMessage(&protocol.Message{Type: protocol.MessageTypeStreamClose, Payload: protocol.MessageStreamClose{StreamID: streamID, Reason: "external write failed"}})
+		cc.closeStream(streamID)
+	}, func(complete bool, err error) {
+		if err != nil || complete {
+			cc.closeStream(streamID)
+		}
+	})
 
 	// Send STREAM_OPEN message to client
 	msg := &protocol.Message{
@@ -427,7 +423,7 @@ func (cc *ClientConnection) forwardExternalToClient(streamID uint32) {
 	// This prevents data loss by ensuring client stream is created first
 	// Timeout after 30 seconds to prevent orphaned streams
 	select {
-	case <-stream.ReadyCh:
+	case <-stream.Ready():
 		// Client is ready, proceed to read
 	case <-time.After(30 * time.Second):
 		// Client didn't send STREAM_READY in time, close stream to free resources
@@ -436,12 +432,10 @@ func (cc *ClientConnection) forwardExternalToClient(streamID uint32) {
 		return
 	}
 
-	stream.Mu.Lock()
-	if stream.Conn1 == nil {
-		stream.Mu.Unlock()
+	conn, open := stream.Connection()
+	if !open {
 		return
 	}
-	stream.Mu.Unlock()
 
 	// Set both read and write deadlines to detect stalled connections
 	// Read timeout is 10 minutes (slow clients allowed, but detect hangs)
@@ -451,22 +445,34 @@ func (cc *ClientConnection) forwardExternalToClient(streamID uint32) {
 	buf := make([]byte, 32*1024)
 	for {
 		// Check if stream is still valid before each read
-		stream.Mu.Lock()
-		if stream.Closed || stream.Conn1 == nil {
-			stream.Mu.Unlock()
+		if stream.IsClosed() {
 			cc.closeStream(streamID)
 			return
 		}
-		stream.Mu.Unlock()
 
 		// Refresh deadlines BEFORE each read to keep timeout active-based (not absolute)
 		// This prevents timeout for continuous streams (audio, video) with buffering or silence periods
 		// stream.Conn1.SetReadDeadline(time.Now().Add(10 * time.Minute))
 		// stream.Conn1.SetWriteDeadline(time.Now().Add(StreamTimeoutDuration))
 
-		n, err := stream.Conn1.Read(buf)
+		n, err := conn.Read(buf)
+		if n > 0 {
+			dataMsg := &protocol.Message{Type: protocol.MessageTypeStreamData, Payload: protocol.MessageStreamData{StreamID: streamID, Data: buf[:n]}}
+			if sendErr := cc.sendMessage(dataMsg); sendErr != nil {
+				log.Printf("Stream %d send error: %v", streamID, sendErr)
+				cc.closeStream(streamID)
+				return
+			}
+		}
 		if err != nil {
-			if err != io.EOF {
+			if err == io.EOF {
+				complete := stream.MarkLocalEOF()
+				cc.sendMessage(&protocol.Message{Type: protocol.MessageTypeStreamClose, Payload: protocol.MessageStreamClose{StreamID: streamID, Reason: "external read closed", HalfClose: true}})
+				if complete {
+					cc.closeStream(streamID)
+				}
+				return
+			} else {
 				// Suppress logging for expected connection closure errors
 				errStr := err.Error()
 				if !strings.Contains(errStr, "use of closed network connection") &&
@@ -487,21 +493,6 @@ func (cc *ClientConnection) forwardExternalToClient(streamID uint32) {
 			cc.closeStream(streamID)
 			return
 		}
-
-		if n > 0 {
-			dataMsg := &protocol.Message{
-				Type: protocol.MessageTypeStreamData,
-				Payload: protocol.MessageStreamData{
-					StreamID: streamID,
-					Data:     buf[:n],
-				},
-			}
-			if err := cc.sendMessage(dataMsg); err != nil {
-				log.Printf("Stream %d send error: %v", streamID, err)
-				cc.closeStream(streamID)
-				return
-			}
-		}
 	}
 }
 
@@ -521,26 +512,24 @@ func (cc *ClientConnection) handleStreamData(payload protocol.MessageStreamData)
 		return
 	}
 
-	// Snapshot the connection under the lifecycle lock. Closing a net.Conn
-	// concurrently with Write is safe and must be able to interrupt blocked I/O.
-	stream.Mu.Lock()
-	conn := stream.Conn1
-	closed := stream.Closed
-	stream.Mu.Unlock()
-	if closed || conn == nil {
-		cc.closeStream(payload.StreamID)
-		return
-	}
-	conn.SetWriteDeadline(time.Now().Add(StreamTimeoutDuration))
-	if _, err := conn.Write(payload.Data); err != nil {
-		log.Printf("Stream %d write error: %v", payload.StreamID, err)
+	if !stream.Enqueue(payload.Data) {
+		log.Printf("Stream %d inbound queue is full", payload.StreamID)
+		cc.sendMessage(&protocol.Message{Type: protocol.MessageTypeStreamClose, Payload: protocol.MessageStreamClose{StreamID: payload.StreamID, Reason: "server stream queue full"}})
 		cc.closeStream(payload.StreamID)
 	}
-
 }
 
 // handleStreamClose handles stream close from client
 func (cc *ClientConnection) handleStreamClose(payload protocol.MessageStreamClose) {
+	if payload.HalfClose {
+		cc.streamsMu.RLock()
+		stream := cc.streams[payload.StreamID]
+		cc.streamsMu.RUnlock()
+		if stream != nil && !stream.EnqueueHalfClose() {
+			cc.closeStream(payload.StreamID)
+		}
+		return
+	}
 	cc.closeStream(payload.StreamID)
 	log.Printf("Stream %d closed: %s", payload.StreamID, payload.Reason)
 	if cc.server.logger != nil {
@@ -581,6 +570,9 @@ func (cc *ClientConnection) sendMessage(msg *protocol.Message) error {
 		return err
 	}
 
+	if err := cc.conn.SetWriteDeadline(time.Now().Add(WriteTimeoutDuration)); err != nil {
+		return err
+	}
 	_, err = cc.conn.Write(data)
 	return err
 }

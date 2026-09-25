@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -67,8 +68,52 @@ For detailed help on a command:
 `, config.Version)
 }
 
-// registerService creates a systemd service file for the given command
-func registerService(serviceName, command string) error {
+func systemdQuote(arg string) string {
+	// Percent signs are systemd specifiers even inside quotes.
+	return strconv.Quote(strings.ReplaceAll(arg, "%", "%%"))
+}
+
+func renderService(serviceName, binaryPath string, args []string) string {
+	quoted := make([]string, 0, len(args)+1)
+	quoted = append(quoted, systemdQuote(binaryPath))
+	for _, arg := range args {
+		quoted = append(quoted, systemdQuote(arg))
+	}
+	return fmt.Sprintf(`[Unit]
+Description=GoTunnel %s Service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%s
+Restart=on-failure
+RestartSec=10
+DynamicUser=yes
+StateDirectory=gotunnel
+WorkingDirectory=/var/lib/gotunnel
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+`, serviceName, strings.Join(quoted, " "))
+}
+
+// registerService creates a systemd service file for the given arguments.
+func registerService(serviceName string, args []string) error {
 	// Check for root privileges
 	if !isRoot() {
 		return fmt.Errorf("service registration requires root privileges. Use: sudo gotunnel %s -register", serviceName)
@@ -86,27 +131,12 @@ func registerService(serviceName, command string) error {
 		return fmt.Errorf("failed to create systemd directory: %w", err)
 	}
 
-	// Create systemd service file content (system-wide service)
-	serviceContent := fmt.Sprintf(`[Unit]
-Description=GoTunnel %s Service
-After=network.target
-
-[Service]
-Type=simple
-ExecStart=%s %s
-Restart=always
-RestartSec=10
-StandardOutput=journal
-StandardError=journal
-
-[Install]
-WantedBy=multi-user.target
-`, serviceName, binaryPath, command)
+	serviceContent := renderService(serviceName, binaryPath, args)
 
 	serviceFile := filepath.Join(serviceDir, fmt.Sprintf("gotunnel-%s.service", serviceName))
 
 	// Write service file
-	if err := os.WriteFile(serviceFile, []byte(serviceContent), 0644); err != nil {
+	if err := os.WriteFile(serviceFile, []byte(serviceContent), 0600); err != nil {
 		return fmt.Errorf("failed to write service file: %w", err)
 	}
 
@@ -176,7 +206,12 @@ func runServer() {
 	configPath := fs.String("config", "", "Path to config file (optional, for persistence)")
 	port := fs.Int("port", 7727, "Server tunnel port")
 	panelPort := fs.Int("panel-port", 7726, "Web panel port")
-	password := fs.String("password", "", "Server password")
+	panelHost := fs.String("panel-host", "0.0.0.0", "Web panel bind address")
+	password := fs.String("password", "", "Legacy shared password")
+	clientPassword := fs.String("client-password", "", "Tunnel client password")
+	adminPassword := fs.String("admin-password", "", "Web panel password")
+	tlsCert := fs.String("tls-cert", "", "TLS certificate for client transport")
+	tlsKey := fs.String("tls-key", "", "TLS private key for client transport")
 	debug := fs.Bool("debug", false, "Enable debug logging")
 	register := fs.Bool("register", false, "Register as systemd service")
 	unregister := fs.Bool("unregister", false, "Unregister systemd service")
@@ -192,7 +227,12 @@ OPTIONS:
   -config string      Path to config file (optional, for persistence)
   -port int           Server tunnel port (default 7727)
   -panel-port int     Web panel port (default 7726)
-  -password string    Server password (required for normal operation)
+  -panel-host string  Web panel bind address (default "0.0.0.0")
+  -password string    Legacy shared password
+  -client-password string  Tunnel client password
+  -admin-password string   Web panel password
+  -tls-cert string    TLS certificate for client transport
+  -tls-key string     TLS private key for client transport
   -debug              Enable debug logging
   -register           Register as systemd service with current options (requires root)
   -unregister         Unregister systemd service (requires root)
@@ -224,18 +264,27 @@ EXAMPLES:
 
 	// Handle register (doesn't need password validation)
 	if *register {
-		// Reconstruct command without -register flag
 		filteredArgs := filterArgs(os.Args[2:])
-		commandStr := "server " + strings.Join(filteredArgs, " ")
-		if err := registerService("server", commandStr); err != nil {
+		args := append([]string{"server"}, filteredArgs...)
+		if err := registerService("server", args); err != nil {
 			log.Fatalf("Failed to register service: %v", err)
 		}
 		return
 	}
 
-	// Validate password is provided for normal operation
-	if *password == "" {
-		log.Fatalf("Error: -password flag is required. Usage: gotunnel server -password <your_password>")
+	if *password != "" {
+		if *clientPassword == "" {
+			*clientPassword = *password
+		}
+		if *adminPassword == "" {
+			*adminPassword = *password
+		}
+	}
+	if *clientPassword == "" || *adminPassword == "" {
+		log.Fatalf("Error: provide -client-password and -admin-password (or legacy -password)")
+	}
+	if (*tlsCert == "") != (*tlsKey == "") {
+		log.Fatalf("Error: -tls-cert and -tls-key must be provided together")
 	}
 
 	if *debug {
@@ -259,9 +308,11 @@ EXAMPLES:
 		log.Println("Running with default config (no persistence)")
 	}
 
-	// Set password from flag (already validated above)
-	if err := cfgMgr.SetServerPassword(*password); err != nil {
-		log.Fatalf("Failed to set password: %v", err)
+	if err := cfgMgr.SetClientPassword(*clientPassword); err != nil {
+		log.Fatalf("Failed to set client password: %v", err)
+	}
+	if err := cfgMgr.SetAdminPassword(*adminPassword); err != nil {
+		log.Fatalf("Failed to set admin password: %v", err)
 	}
 
 	if *port != 7727 {
@@ -275,9 +326,19 @@ EXAMPLES:
 			log.Fatalf("Failed to set panel port: %v", err)
 		}
 	}
+	if *panelHost != "0.0.0.0" {
+		if err := cfgMgr.SetPanelHost(*panelHost); err != nil {
+			log.Fatalf("Failed to set panel host: %v", err)
+		}
+	}
 
 	// Create and start server
 	srv := server.NewServer(cfgMgr)
+	if *tlsCert != "" {
+		if err := srv.EnableTLS(*tlsCert, *tlsKey); err != nil {
+			log.Fatalf("Failed to enable TLS: %v", err)
+		}
+	}
 	if err := srv.Start(); err != nil {
 		log.Fatalf("Failed to start server: %v", err)
 	}
@@ -303,6 +364,8 @@ func runClient() {
 	debug := fs.Bool("debug", false, "Enable debug logging")
 	verbose := fs.Bool("verbose", false, "Enable verbose output")
 	reconnectInterval := fs.Int("reconnect-interval", 5, "Reconnect interval in seconds")
+	tlsCA := fs.String("tls-ca", "", "CA certificate for encrypted server verification")
+	tlsServerName := fs.String("tls-server-name", "", "TLS certificate server name")
 	register := fs.Bool("register", false, "Register as systemd service")
 	unregister := fs.Bool("unregister", false, "Unregister systemd service")
 	help := fs.Bool("help", false, "Show help message")
@@ -320,6 +383,8 @@ OPTIONS:
 	  -debug                     Enable debug logging
   -verbose                   Enable verbose output
   -reconnect-interval int    Reconnect interval in seconds (default 5)
+  -tls-ca string             CA certificate for encrypted server verification
+  -tls-server-name string    TLS certificate server name
   -register                  Register as systemd service with current options (requires root)
   -unregister                Unregister systemd service (requires root)
   -help                      Show this help message
@@ -350,10 +415,9 @@ EXAMPLES:
 
 	// Handle register (doesn't need other flag validation)
 	if *register {
-		// Reconstruct command without -register flag
 		filteredArgs := filterArgs(os.Args[2:])
-		commandStr := "client " + strings.Join(filteredArgs, " ")
-		if err := registerService("client", commandStr); err != nil {
+		args := append([]string{"client"}, filteredArgs...)
+		if err := registerService("client", args); err != nil {
 			log.Fatalf("Failed to register service: %v", err)
 		}
 		return
@@ -376,6 +440,11 @@ EXAMPLES:
 
 	// Create client
 	cli := client.NewClient(*server, *name, *pass)
+	if *tlsCA != "" || *tlsServerName != "" {
+		if err := cli.EnableTLS(*tlsCA, *tlsServerName); err != nil {
+			log.Fatalf("Failed to configure TLS: %v", err)
+		}
+	}
 	if err := cli.SetReconnectInterval(time.Duration(*reconnectInterval) * time.Second); err != nil {
 		log.Fatalf("Invalid reconnect interval: %v", err)
 	}

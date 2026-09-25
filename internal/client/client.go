@@ -1,10 +1,14 @@
 package client
 
 import (
+	"crypto/tls"
+	"crypto/x509"
 	"fmt"
 	"io"
 	"log"
+	"math/rand/v2"
 	"net"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -22,6 +26,7 @@ const (
 	KeepaliveInterval       = 10 * time.Second
 	MaxConcurrentLocalConns = 50 // Prevent file descriptor exhaustion
 	MaxStreamsPerClient     = 100
+	MaxReconnectInterval    = time.Minute
 )
 
 // Client handles the client-side tunnel logic
@@ -47,6 +52,35 @@ type Client struct {
 
 	connected bool
 	connMu    sync.Mutex
+	dialSlots chan struct{}
+	tlsConfig *tls.Config
+}
+
+// EnableTLS enables verified TLS for the control connection. caFile may be
+// empty to use the operating system trust store.
+func (c *Client) EnableTLS(caFile, serverName string) error {
+	roots, err := x509.SystemCertPool()
+	if err != nil || roots == nil {
+		roots = x509.NewCertPool()
+	}
+	if caFile != "" {
+		pemData, err := os.ReadFile(caFile)
+		if err != nil {
+			return fmt.Errorf("read TLS CA: %w", err)
+		}
+		if !roots.AppendCertsFromPEM(pemData) {
+			return fmt.Errorf("TLS CA file contains no certificates")
+		}
+	}
+	if serverName == "" {
+		host, _, err := net.SplitHostPort(c.serverAddr)
+		if err != nil {
+			return fmt.Errorf("derive TLS server name: %w", err)
+		}
+		serverName = host
+	}
+	c.tlsConfig = &tls.Config{RootCAs: roots, ServerName: serverName, MinVersion: tls.VersionTLS13}
+	return nil
 }
 
 // NewClient creates a new client instance
@@ -59,6 +93,7 @@ func NewClient(serverAddr, machineID, password string) *Client {
 		streams:           make(map[uint32]*tunnel.Stream),
 		stopCh:            make(chan struct{}),
 		doneCh:            make(chan struct{}),
+		dialSlots:         make(chan struct{}, MaxConcurrentLocalConns),
 	}
 }
 
@@ -95,6 +130,7 @@ func (c *Client) Stop() error {
 // reconnectLoop maintains connection to server with automatic reconnection
 func (c *Client) reconnectLoop() {
 	defer close(c.doneCh)
+	failures := 0
 
 	for {
 		select {
@@ -105,15 +141,15 @@ func (c *Client) reconnectLoop() {
 
 		if err := c.connect(); err != nil {
 			log.Printf("Connection failed: %v", err)
-			log.Printf("Retrying in %v...", c.reconnectInterval)
-
-			select {
-			case <-c.stopCh:
+			delay := reconnectDelay(c.reconnectInterval, failures)
+			failures++
+			log.Printf("Retrying in %v...", delay)
+			if !c.waitForRetry(delay) {
 				return
-			case <-time.After(c.reconnectInterval):
 			}
 			continue
 		}
+		failures = 0
 
 		// Connection successful, handle messages
 		c.handleMessages()
@@ -122,17 +158,54 @@ func (c *Client) reconnectLoop() {
 		log.Printf("Connection lost, reconnecting...")
 		c.closeConnection()
 
-		select {
-		case <-c.stopCh:
+		if !c.waitForRetry(reconnectDelay(c.reconnectInterval, 0)) {
 			return
-		case <-time.After(c.reconnectInterval):
 		}
 	}
 }
 
+func (c *Client) waitForRetry(delay time.Duration) bool {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-c.stopCh:
+		return false
+	case <-timer.C:
+		return true
+	}
+}
+
+func reconnectDelay(base time.Duration, failures int) time.Duration {
+	delay := base
+	for i := 0; i < failures && delay < MaxReconnectInterval; i++ {
+		if delay > MaxReconnectInterval/2 {
+			delay = MaxReconnectInterval
+			break
+		}
+		delay *= 2
+	}
+	if delay > MaxReconnectInterval {
+		delay = MaxReconnectInterval
+	}
+	// Up to 20% downward jitter prevents synchronized reconnect storms while
+	// preserving the configured interval as the upper bound.
+	jitter := delay / 5
+	if jitter <= 0 {
+		return delay
+	}
+	return delay - jitter + time.Duration(rand.Int64N(int64(jitter)+1))
+}
+
 // connect connects to the server and authenticates
 func (c *Client) connect() error {
-	conn, err := net.DialTimeout("tcp", c.serverAddr, ReadTimeoutDuration)
+	dialer := &net.Dialer{Timeout: ReadTimeoutDuration}
+	var conn net.Conn
+	var err error
+	if c.tlsConfig != nil {
+		conn, err = tls.DialWithDialer(dialer, "tcp", c.serverAddr, c.tlsConfig)
+	} else {
+		conn, err = dialer.Dial("tcp", c.serverAddr)
+	}
 	if err != nil {
 		return fmt.Errorf("failed to connect to server: %w", err)
 	}
@@ -226,34 +299,48 @@ func (c *Client) connect() error {
 
 // handleMessages handles incoming messages from server
 func (c *Client) handleMessages() {
+	c.connMu.Lock()
+	controlConn := c.conn
+	c.connMu.Unlock()
+	if controlConn == nil {
+		return
+	}
 	// Enable TCP keepalive to detect half-open connections
-	if tcpConn, ok := c.conn.(*net.TCPConn); ok {
+	if tcpConn, ok := controlConn.(*net.TCPConn); ok {
 		tcpConn.SetKeepAlive(true)
 		tcpConn.SetKeepAlivePeriod(30 * time.Second)
 	}
 
-	// Start PING/PONG keepalive ticker
-	ticker := time.NewTicker(KeepaliveInterval)
-	defer ticker.Stop()
-
-	// Set read/write deadlines for the connection
-	if c.conn != nil {
-		c.conn.SetReadDeadline(time.Now().Add(ReadTimeoutDuration))
-		c.conn.SetWriteDeadline(time.Now().Add(WriteTimeoutDuration))
-	}
+	// The server sends keepalives. This deadline advances only after receiving
+	// real traffic, so a silent peer cannot keep itself alive locally.
+	controlConn.SetReadDeadline(time.Now().Add(ReadTimeoutDuration))
 
 	// Message reading goroutine
 	msgCh := make(chan *protocol.Message)
-	errCh := make(chan error)
+	errCh := make(chan error, 1)
+	readerDone := make(chan struct{})
+	readerExited := make(chan struct{})
+	defer func() {
+		close(readerDone)
+		controlConn.SetReadDeadline(time.Now())
+		<-readerExited
+	}()
 	go func() {
-		defer close(msgCh) // FIX #3: Close channel when reader exits to prevent leak
+		defer close(readerExited)
 		for {
-			msg, err := c.readMessage()
+			msg, err := protocol.Read(controlConn)
 			if err != nil {
-				errCh <- err
+				select {
+				case errCh <- err:
+				case <-readerDone:
+				}
 				return
 			}
-			msgCh <- msg
+			select {
+			case msgCh <- msg:
+			case <-readerDone:
+				return
+			}
 		}
 	}()
 
@@ -262,24 +349,6 @@ func (c *Client) handleMessages() {
 		case <-c.stopCh:
 			return
 
-		case <-ticker.C:
-			// Send periodic PING to detect dead connection
-			pingMsg := &protocol.Message{
-				Type: protocol.MessageTypePing,
-				Payload: protocol.MessagePing{
-					Timestamp: time.Now().Unix(),
-				},
-			}
-			if err := c.sendMessage(pingMsg); err != nil {
-				log.Printf("Failed to send PING: %v", err)
-				return
-			}
-			// Refresh read/write deadlines after each PING
-			if c.conn != nil {
-				c.conn.SetReadDeadline(time.Now().Add(ReadTimeoutDuration))
-				c.conn.SetWriteDeadline(time.Now().Add(WriteTimeoutDuration))
-			}
-
 		case err := <-errCh:
 			if err != io.EOF {
 				log.Printf("Error reading message: %v", err)
@@ -287,6 +356,7 @@ func (c *Client) handleMessages() {
 			return
 
 		case msg := <-msgCh:
+			controlConn.SetReadDeadline(time.Now().Add(ReadTimeoutDuration))
 
 			switch msg.Type {
 			case protocol.MessageTypeTunnelConfig:
@@ -303,7 +373,15 @@ func (c *Client) handleMessages() {
 					log.Printf("Invalid STREAM_OPEN payload")
 					continue
 				}
-				c.handleStreamOpen(payload)
+				select {
+				case c.dialSlots <- struct{}{}:
+					go func() {
+						defer func() { <-c.dialSlots }()
+						c.handleStreamOpen(controlConn, payload)
+					}()
+				default:
+					c.sendMessageOn(controlConn, &protocol.Message{Type: protocol.MessageTypeStreamClose, Payload: protocol.MessageStreamClose{StreamID: payload.StreamID, Reason: "too many pending local connections"}})
+				}
 
 			case protocol.MessageTypeStreamClose:
 				payload, ok := msg.Payload.(protocol.MessageStreamClose)
@@ -330,7 +408,7 @@ func (c *Client) handleMessages() {
 							Timestamp: payload.Timestamp,
 						},
 					}
-					c.sendMessage(response)
+					c.sendMessageOn(controlConn, response)
 					log.Printf("Received PING from server, sending PONG")
 				}
 
@@ -360,7 +438,7 @@ func (c *Client) handleTunnelConfig(payload protocol.MessageTunnelConfig) {
 }
 
 // handleStreamOpen handles server request to open a stream
-func (c *Client) handleStreamOpen(payload protocol.MessageStreamOpen) {
+func (c *Client) handleStreamOpen(controlConn net.Conn, payload protocol.MessageStreamOpen) {
 	streamID := payload.StreamID
 	localPort := payload.LocalPort
 
@@ -378,7 +456,7 @@ func (c *Client) handleStreamOpen(payload protocol.MessageStreamOpen) {
 				Reason:   "client stream limit exceeded",
 			},
 		}
-		c.sendMessage(msg)
+		c.sendMessageOn(controlConn, msg)
 		return
 	}
 
@@ -395,7 +473,7 @@ func (c *Client) handleStreamOpen(payload protocol.MessageStreamOpen) {
 				Reason:   fmt.Sprintf("failed to connect to localhost:%d", localPort),
 			},
 		}
-		c.sendMessage(msg)
+		c.sendMessageOn(controlConn, msg)
 		return
 	}
 
@@ -404,8 +482,23 @@ func (c *Client) handleStreamOpen(payload protocol.MessageStreamOpen) {
 
 	// Store stream in map
 	c.streamsMu.Lock()
+	if len(c.streams) >= MaxStreamsPerClient || c.streams[streamID] != nil {
+		c.streamsMu.Unlock()
+		localConn.Close()
+		c.sendMessageOn(controlConn, &protocol.Message{Type: protocol.MessageTypeStreamClose, Payload: protocol.MessageStreamClose{StreamID: streamID, Reason: "client stream limit exceeded or duplicate stream"}})
+		return
+	}
 	c.streams[streamID] = stream
 	c.streamsMu.Unlock()
+	stream.StartWriter(StreamTimeoutDuration, func(err error) {
+		log.Printf("Stream %d local write error: %v", streamID, err)
+		c.sendMessageOn(controlConn, &protocol.Message{Type: protocol.MessageTypeStreamClose, Payload: protocol.MessageStreamClose{StreamID: streamID, Reason: "local service write failed"}})
+		c.closeStream(streamID)
+	}, func(complete bool, err error) {
+		if err != nil || complete {
+			c.closeStream(streamID)
+		}
+	})
 
 	// Only set write deadline to prevent hangs on sends
 	// Don't set read deadline - local service may send data slowly
@@ -420,7 +513,7 @@ func (c *Client) handleStreamOpen(payload protocol.MessageStreamOpen) {
 			StreamID: streamID,
 		},
 	}
-	if err := c.sendMessage(readyMsg); err != nil {
+	if err := c.sendMessageOn(controlConn, readyMsg); err != nil {
 		log.Printf("Stream %d: failed to send STREAM_READY: %v", streamID, err)
 		stream.Close()
 		c.streamsMu.Lock()
@@ -432,17 +525,12 @@ func (c *Client) handleStreamOpen(payload protocol.MessageStreamOpen) {
 	log.Printf("Stream %d connected to localhost:%d", streamID, localPort)
 
 	// Start handling bidirectional data
-	c.handleStreamData(streamID, stream)
+	c.handleStreamData(controlConn, streamID, stream)
 }
 
 // handleStreamData handles bidirectional data transfer for a stream
-func (c *Client) handleStreamData(streamID uint32, stream *tunnel.Stream) {
-	var wg sync.WaitGroup
-
-	// Goroutine: Read from localhost and send to server
-	wg.Add(1)
+func (c *Client) handleStreamData(controlConn net.Conn, streamID uint32, stream *tunnel.Stream) {
 	go func() {
-		defer wg.Done()
 		buf := make([]byte, 32*1024)
 
 		for {
@@ -454,24 +542,37 @@ func (c *Client) handleStreamData(streamID uint32, stream *tunnel.Stream) {
 			}
 
 			// Lock stream to check if it's still valid
-			stream.Mu.Lock()
-			if stream.Closed || stream.Conn1 == nil {
-				stream.Mu.Unlock()
+			conn, open := stream.Connection()
+			if !open {
 				return
 			}
-			stream.Mu.Unlock()
 
 			// Set read timeout to prevent blocking indefinitely on slow local service
 			// Also allows for periodic stop signal checks
-			stream.Conn1.SetReadDeadline(time.Now().Add(5 * time.Second))
+			conn.SetReadDeadline(time.Now().Add(5 * time.Second))
 
-			n, err := stream.Conn1.Read(buf)
+			n, err := conn.Read(buf)
+			if n > 0 {
+				dataMsg := &protocol.Message{Type: protocol.MessageTypeStreamData, Payload: protocol.MessageStreamData{StreamID: streamID, Data: buf[:n]}}
+				if sendErr := c.sendMessageOn(controlConn, dataMsg); sendErr != nil {
+					log.Printf("Stream %d send error: %v", streamID, sendErr)
+					c.closeStream(streamID)
+					return
+				}
+			}
 			if err != nil {
 				// Check if it's a timeout (expected, will retry)
 				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 					continue // Retry read with stop signal check
 				}
-				if err != io.EOF {
+				if err == io.EOF {
+					complete := stream.MarkLocalEOF()
+					c.sendMessageOn(controlConn, &protocol.Message{Type: protocol.MessageTypeStreamClose, Payload: protocol.MessageStreamClose{StreamID: streamID, Reason: "local read closed", HalfClose: true}})
+					if complete {
+						c.closeStream(streamID)
+					}
+					return
+				} else {
 					// Suppress logging for expected connection closure errors
 					errStr := err.Error()
 					if !strings.Contains(errStr, "use of closed network connection") &&
@@ -488,36 +589,11 @@ func (c *Client) handleStreamData(streamID uint32, stream *tunnel.Stream) {
 						Reason:   "local connection closed",
 					},
 				}
-				c.sendMessage(msg)
+				c.sendMessageOn(controlConn, msg)
+				c.closeStream(streamID)
 				return
 			}
-
-			if n > 0 {
-
-				// Refresh write deadline after each successful read
-				stream.Conn1.SetWriteDeadline(time.Now().Add(StreamTimeoutDuration))
-
-				// Send data to server
-				dataMsg := &protocol.Message{
-					Type: protocol.MessageTypeStreamData,
-					Payload: protocol.MessageStreamData{
-						StreamID: streamID,
-						Data:     buf[:n],
-					},
-				}
-				if err := c.sendMessage(dataMsg); err != nil {
-					log.Printf("Stream %d send error: %v", streamID, err)
-					return
-				}
-			}
 		}
-	}()
-
-	// FIX #1: Simplified cleanup - wait for reader to finish, then close stream
-	// Cleanup goroutine NOT part of WaitGroup (prevents deadlock)
-	go func() {
-		wg.Wait() // Wait for reader goroutine to finish
-		c.closeStream(streamID)
 	}()
 }
 
@@ -537,26 +613,24 @@ func (c *Client) handleIncomingStreamData(payload protocol.MessageStreamData) {
 		return
 	}
 
-	// Snapshot the connection under the lifecycle lock. Closing a net.Conn
-	// concurrently with Write is safe and must be able to interrupt blocked I/O.
-	stream.Mu.Lock()
-	conn := stream.Conn1
-	closed := stream.Closed
-	stream.Mu.Unlock()
-	if closed || conn == nil {
-		c.closeStream(payload.StreamID)
-		return
-	}
-	conn.SetWriteDeadline(time.Now().Add(StreamTimeoutDuration))
-	if _, err := conn.Write(payload.Data); err != nil {
-		log.Printf("Stream %d write error: %v", payload.StreamID, err)
+	if !stream.Enqueue(payload.Data) {
+		log.Printf("Stream %d inbound queue is full", payload.StreamID)
+		c.sendMessage(&protocol.Message{Type: protocol.MessageTypeStreamClose, Payload: protocol.MessageStreamClose{StreamID: payload.StreamID, Reason: "client stream queue full"}})
 		c.closeStream(payload.StreamID)
 	}
-
 }
 
 // handleStreamClose handles server stream close
 func (c *Client) handleStreamClose(payload protocol.MessageStreamClose) {
+	if payload.HalfClose {
+		c.streamsMu.RLock()
+		stream := c.streams[payload.StreamID]
+		c.streamsMu.RUnlock()
+		if stream != nil && !stream.EnqueueHalfClose() {
+			c.closeStream(payload.StreamID)
+		}
+		return
+	}
 	c.closeStream(payload.StreamID)
 	log.Printf("Stream %d closed: %s", payload.StreamID, payload.Reason)
 }
@@ -595,12 +669,25 @@ func (c *Client) sendMessage(msg *protocol.Message) error {
 	}
 	conn := c.conn
 	c.connMu.Unlock()
+	return c.sendMessageOn(conn, msg)
+}
+
+func (c *Client) sendMessageOn(conn net.Conn, msg *protocol.Message) error {
+	c.connMu.Lock()
+	current := c.connected && c.conn == conn
+	c.connMu.Unlock()
+	if !current {
+		return fmt.Errorf("connection generation is no longer active")
+	}
 
 	data, err := protocol.Encode(msg)
 	if err != nil {
 		return err
 	}
 
+	if err := conn.SetWriteDeadline(time.Now().Add(WriteTimeoutDuration)); err != nil {
+		return err
+	}
 	_, err = conn.Write(data)
 	return err
 }

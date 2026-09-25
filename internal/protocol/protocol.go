@@ -94,8 +94,9 @@ type MessageStreamData struct {
 
 // MessageStreamClose - Close a stream
 type MessageStreamClose struct {
-	StreamID uint32 `json:"stream_id"`
-	Reason   string `json:"reason,omitempty"`
+	StreamID  uint32 `json:"stream_id"`
+	Reason    string `json:"reason,omitempty"`
+	HalfClose bool   `json:"half_close,omitempty"`
 }
 
 // MessageStreamReady - Client acknowledges stream is ready

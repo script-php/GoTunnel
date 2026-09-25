@@ -7,19 +7,26 @@ import (
 	"fmt"
 	"io/fs"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
 // Logging constants
 const (
-	LogBatchSize     = 10              // Batch writes after this many entries
-	LogFlushInterval = 1 * time.Second // Or after this duration
+	LogBatchSize      = 10              // Batch writes after this many entries
+	LogFlushInterval  = 1 * time.Second // Or after this duration
+	MaxSessions       = 1000
+	MaxRateLimitIPs   = 10000
+	MaxAPIBodySize    = 1 << 20
+	DefaultMaxLogSize = 10 << 20
 )
 
 //go:embed web/*
@@ -53,21 +60,24 @@ type Logger struct {
 	filePath string
 
 	// Buffered file writing
-	logCh     chan LogEntry
-	doneCh    chan struct{}
-	fileHdl   *os.File
-	closeOnce sync.Once
-	closed    bool
+	logCh       chan LogEntry
+	doneCh      chan struct{}
+	fileHdl     *os.File
+	closeOnce   sync.Once
+	closed      bool
+	dropped     atomic.Uint64
+	maxFileSize int64
 }
 
 // NewLogger creates a new logger with buffered file writes
 func NewLogger(logPath string, maxSize int) *Logger {
 	l := &Logger{
-		entries:  make([]LogEntry, 0, maxSize),
-		maxSize:  maxSize,
-		filePath: logPath,
-		logCh:    make(chan LogEntry, LogBatchSize*2),
-		doneCh:   make(chan struct{}),
+		entries:     make([]LogEntry, 0, maxSize),
+		maxSize:     maxSize,
+		filePath:    logPath,
+		logCh:       make(chan LogEntry, LogBatchSize*2),
+		doneCh:      make(chan struct{}),
+		maxFileSize: DefaultMaxLogSize,
 	}
 
 	// Start background writer goroutine if file path is set
@@ -88,8 +98,15 @@ func (l *Logger) fileWriterLoop() {
 		os.MkdirAll(dir, 0755)
 	}
 
-	// Open file once for appending
-	f, err := os.OpenFile(l.filePath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if info, err := os.Stat(l.filePath); err == nil && info.Size() >= l.maxFileSize {
+		if err := os.Remove(l.filePath + ".1"); err != nil && !os.IsNotExist(err) {
+			log.Printf("Warning: failed to remove previous rotated log: %v", err)
+		}
+		if err := os.Rename(l.filePath, l.filePath+".1"); err != nil {
+			log.Printf("Warning: failed to rotate log file: %v", err)
+		}
+	}
+	f, err := os.OpenFile(l.filePath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600)
 	if err != nil {
 		log.Printf("Warning: failed to open log file: %v", err)
 		f = nil
@@ -140,9 +157,14 @@ func (l *Logger) fileWriterLoop() {
 func (l *Logger) writeBatchToFile(f *os.File, entries []LogEntry) {
 	for _, entry := range entries {
 		logLine := fmt.Sprintf("[%s] %s: %s\n", entry.Timestamp, entry.Level, entry.Message)
-		f.WriteString(logLine)
+		if _, err := f.WriteString(logLine); err != nil {
+			log.Printf("Failed to write log entry: %v", err)
+			l.dropped.Add(1)
+		}
 	}
-	f.Sync() // Ensure data is written to disk
+	if err := f.Sync(); err != nil {
+		log.Printf("Failed to sync log file: %v", err)
+	}
 }
 
 // Add adds a log entry
@@ -168,7 +190,7 @@ func (l *Logger) Add(level, message string) {
 		select {
 		case l.logCh <- entry:
 		default:
-			// Channel full, drop message to prevent blocking
+			l.dropped.Add(1)
 		}
 	}
 	l.mu.Unlock()
@@ -238,6 +260,10 @@ func (l *Logger) Count() int {
 	return len(l.entries)
 }
 
+func (l *Logger) Dropped() uint64 {
+	return l.dropped.Load()
+}
+
 // WebServer handles the HTTP web panel for the server
 type WebServer struct {
 	server       *http.Server
@@ -251,9 +277,9 @@ type WebServer struct {
 }
 
 // NewWebServer creates a new web server
-func NewWebServer(port int, password string) *WebServer {
+func NewWebServer(host string, port int, password string) *WebServer {
 	return &WebServer{
-		port:       fmt.Sprintf("0.0.0.0:%d", port),
+		port:       net.JoinHostPort(host, fmt.Sprintf("%d", port)),
 		password:   password,
 		sessions:   make(map[string]*Session),
 		rateLimits: make(map[string]*RateLimitEntry),
@@ -268,6 +294,7 @@ func (ws *WebServer) Start(s *Server) error {
 	// Middleware for API endpoints
 	apiMiddleware := func(handler func(http.ResponseWriter, *http.Request)) http.HandlerFunc {
 		return func(w http.ResponseWriter, r *http.Request) {
+			r.Body = http.MaxBytesReader(w, r.Body, MaxAPIBodySize)
 			// Allow login without session
 			if strings.HasSuffix(r.URL.Path, "/login") || strings.HasSuffix(r.URL.Path, "/session") {
 				handler(w, r)
@@ -413,8 +440,13 @@ func (ws *WebServer) Start(s *Server) error {
 	}))
 
 	ws.server = &http.Server{
-		Addr:    ws.port,
-		Handler: mux,
+		Addr:              ws.port,
+		Handler:           mux,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       60 * time.Second,
+		MaxHeaderBytes:    16 << 10,
 	}
 
 	go func() {
@@ -463,6 +495,48 @@ func generateToken() string {
 	return fmt.Sprintf("%x", b)
 }
 
+func requestClientIP(r *http.Request) string {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		host = r.RemoteAddr
+	}
+	peer := net.ParseIP(host)
+	if peer != nil && peer.IsLoopback() {
+		if forwarded := strings.TrimSpace(strings.Split(r.Header.Get("X-Forwarded-For"), ",")[0]); net.ParseIP(forwarded) != nil {
+			return forwarded
+		}
+	}
+	return host
+}
+
+func isSecureRequest(r *http.Request) bool {
+	if r.TLS != nil {
+		return true
+	}
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		host = r.RemoteAddr
+	}
+	peer := net.ParseIP(host)
+	return peer != nil && peer.IsLoopback() && strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https")
+}
+
+func (ws *WebServer) pruneSessionsLocked(now time.Time) {
+	for token, session := range ws.sessions {
+		if now.After(session.ExpiresAt) {
+			delete(ws.sessions, token)
+		}
+	}
+}
+
+func (ws *WebServer) pruneRateLimitsLocked(now time.Time) {
+	for ip, entry := range ws.rateLimits {
+		if now.Sub(entry.LastAttempt) > 15*time.Minute && now.After(entry.LockedUntil) {
+			delete(ws.rateLimits, ip)
+		}
+	}
+}
+
 // handleLogin authenticates user and creates session
 func (ws *WebServer) handleLogin(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
@@ -473,15 +547,18 @@ func (ws *WebServer) handleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Rate limiting
-	clientIP := r.RemoteAddr
-	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-		clientIP = strings.Split(xff, ",")[0]
-	}
+	clientIP := requestClientIP(r)
 
 	ws.rateLimitsMu.Lock()
 	rateLimit := ws.rateLimits[clientIP]
 	if rateLimit == nil {
+		ws.pruneRateLimitsLocked(time.Now())
+		if len(ws.rateLimits) >= MaxRateLimitIPs {
+			ws.rateLimitsMu.Unlock()
+			w.WriteHeader(http.StatusTooManyRequests)
+			json.NewEncoder(w).Encode(map[string]string{"error": "Too many login sources. Try again later."})
+			return
+		}
 		rateLimit = &RateLimitEntry{}
 		ws.rateLimits[clientIP] = rateLimit
 	}
@@ -545,6 +622,13 @@ func (ws *WebServer) handleLogin(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ws.sessionsMu.Lock()
+	ws.pruneSessionsLocked(time.Now())
+	if len(ws.sessions) >= MaxSessions {
+		ws.sessionsMu.Unlock()
+		w.WriteHeader(http.StatusServiceUnavailable)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Too many active sessions"})
+		return
+	}
 	ws.sessions[token] = session
 	ws.sessionsMu.Unlock()
 
@@ -555,6 +639,7 @@ func (ws *WebServer) handleLogin(w http.ResponseWriter, r *http.Request) {
 		Path:     "/",
 		Expires:  session.ExpiresAt,
 		HttpOnly: true,
+		Secure:   isSecureRequest(r),
 		SameSite: http.SameSiteLaxMode,
 	})
 
@@ -730,19 +815,28 @@ func (ws *WebServer) handleStatus(w http.ResponseWriter, r *http.Request, s *Ser
 			allTunnels[j].(map[string]interface{})["remote"].(int)
 	})
 
-	// Build response
+	var memory runtime.MemStats
+	runtime.ReadMemStats(&memory)
 	status := map[string]interface{}{
 		"clients": clients,
 		"tunnels": allTunnels,
+		"metrics": map[string]interface{}{
+			"uptime_seconds":     int64(time.Since(s.startedAt).Seconds()),
+			"goroutines":         runtime.NumGoroutine(),
+			"memory_alloc_bytes": memory.Alloc,
+			"active_clients":     len(clients),
+			"active_tunnels":     len(allTunnels),
+			"dropped_logs":       ws.logger.Dropped(),
+		},
 	}
 
 	json.NewEncoder(w).Encode(status)
 }
 
 // StartWebPanel starts the web panel for the server
-func (s *Server) StartWebPanel(panelPort int) error {
+func (s *Server) StartWebPanel(panelHost string, panelPort int) error {
 	serverCfg := s.cfgMgr.GetServerConfig()
-	ws := NewWebServer(panelPort, serverCfg.Password)
+	ws := NewWebServer(panelHost, panelPort, serverCfg.AdminPassword)
 
 	// Set the server's logger to the web server's logger
 	s.SetLogger(ws.logger)

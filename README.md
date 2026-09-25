@@ -1,544 +1,307 @@
 # GoTunnel
 
-A self-hosted reverse TCP tunneling solution for exposing local services behind firewalls and NAT.
+GoTunnel is a self-hosted TCP reverse tunnel written in Go. A client running
+behind NAT opens a long-lived control connection to the server. The server then
+accepts traffic on public tunnel ports and multiplexes those streams over that
+connection to services reachable by the client.
 
-## Overview
+The project is a good fit for personal infrastructure, labs, and small
+controlled deployments where a simple executable and web panel are preferable
+to a larger networking platform. Its core is now well defended against common
+failure modes: bounded queues, timeouts, connection liveness checks, graceful
+shutdown, isolated stream failures, optional TLS 1.3, and race-tested integration
+coverage.
 
-GoTunnel is a lightweight, self-contained reverse tunnel server that allows you to expose services running on machines behind firewalls or NAT to the public internet. It uses a persistent client connection to maintain the tunnel, eliminating the need for complex networking configuration.
+It is not yet a high-availability tunneling service. A server is a single point
+of failure, active streams end when a client reconnects, and configuration is
+stored locally. See [Current limits](#current-limits) before using it for a
+critical service.
 
-## How It Works
+## How it works
 
-### Architecture
+```text
+public user -> server tunnel port -> multiplexed control connection -> client -> local service
+                                      server:7727                    LAN/localhost
 
-GoTunnel operates on a client-server model:
+administrator -> HTTP or HTTPS reverse proxy -> web panel -> server state
+```
 
-- **Server**: Runs on a publicly accessible machine (VPS, cloud instance). It listens for client connections and manages port mappings.
-- **Client**: Runs on machines behind firewalls or NAT. It connects to the server and forwards incoming connections to local services.
+Each client authenticates with a client password and registers a unique machine
+name. Tunnel definitions map a public TCP port on the server to a loopback port
+on that client. Every accepted public connection becomes an independent stream
+on the client's control connection.
 
-### Connection Flow
+The control protocol carries authentication, tunnel configuration, stream data,
+ordered half-close notifications, close notifications, and heartbeats. A busy or
+blocked stream cannot grow memory without limit; overflowing that stream's queue
+closes the stream while leaving the client connection and other streams alive.
 
-1. Client initiates a persistent TCP connection to the server on port 7727
-2. Client authenticates with a password
-3. Server sends the list of tunnel configurations to the client
-4. When an external user connects to a tunnel port on the server, the server forwards that connection through the existing client connection
-5. Client accepts the connection and forwards it to the local service
-6. Data flows bidirectionally between the external user and the local service
+## Reliability and security features
 
-### Protocol
+- Separate client and web-administrator credentials, with a legacy
+  `-password` compatibility option
+- Optional TLS 1.3 for the server-client control connection
+- Authentication deadlines and a cap on unauthenticated connections
+- Heartbeat liveness checks and stale-connection cleanup
+- Exponential reconnect delay with jitter, capped at one minute
+- Limits for streams, queued messages, local dials, and message size
+- TCP half-close propagation for protocols that depend on EOF
+- Graceful shutdown of listeners, clients, streams, and the web server
+- Web login throttling, session limits, secure cookie handling, CSRF/origin
+  checks, and security headers
+- Bounded in-memory logs and 10 MiB startup rotation for the log file
+- Runtime status metrics in the authenticated `/api/status` response
+- Hardened systemd units with a dynamic service account and a private unit file
 
-GoTunnel uses a custom binary protocol with the following message types:
+## Build
 
-- AUTH (0): Client authentication request
-- AUTH_RESPONSE (1): Server authentication response
-- TUNNEL_CONFIG (2): Server sends tunnel mappings to client
-- STREAM_OPEN (3): Server initiates a new stream for incoming connection
-- STREAM_READY (4): Client confirms stream is connected to local service
-- STREAM_DATA (5): Bidirectional data transfer
-- STREAM_CLOSE (6): Close stream
-- PING (7): Keepalive from server
-- PONG (8): Keepalive response from client
-
-Keepalive messages (PING/PONG) are sent every 30 seconds to detect dead connections.
-
-## Features
-
-- Single binary for both server and client modes
-- Web-based management panel for dynamic tunnel configuration
-- Add/remove tunnels without restarting
-- Real-time client and tunnel monitoring
-- **Production-hardened reliability**:
- - Comprehensive error handling and recovery
- - Automatic client reconnection with 5-second backoff
- - Keepalive detection (PING/PONG every 30 seconds)
- - Resource limits (100 streams per client, 10MB max message size)
- - Proper goroutine lifecycle management
- - Zero data loss on brief disconnects
-- **Comprehensive logging system**:
- - Real-time log display in web panel
- - Log filtering by level (Info/Warning/Error)
- - File persistence to `logs/gotunnel.log`
- - In-memory circular buffer (latest 1000 entries)
-- **Secure authentication**:
- - Password-protected web panel
- - Session-based authentication
- - Rate limiting (5 failed attempts = 15-minute lockout)
-- Persistent connection-based tunneling (no port scanning)
-- Thread-safe concurrent stream handling
-- Atomic config persistence
-- Systemd service integration for auto-start and monitoring
-
-## Installation
-
-### Building from Source
+GoTunnel uses the Go version declared in `go.mod` (currently Go 1.26.7).
 
 ```bash
-cd GoTunnel
+git clone https://github.com/yourusername/gotunnel.git
+cd gotunnel
 go build -o gotunnel .
 ```
 
-Requires Go 1.18 or later.
+## Secure quick start
 
-## Usage
-
-### Server Mode
-
-Start the server:
+Create independent secrets for clients and administrators. For a public server,
+also provide a certificate whose name matches the address used by clients.
 
 ```bash
-./gotunnel server
+./gotunnel server \
+  -client-password "$CLIENT_SECRET" \
+  -admin-password "$ADMIN_SECRET" \
+  -tls-cert server.crt \
+  -tls-key server.key \
+  -config config.json \
+  -panel-host 127.0.0.1
 ```
 
-With options:
+Connect a client with a private CA:
 
 ```bash
-./gotunnel server -port 7727 -panel-port 7726 -password MyPassword -config config.json
+./gotunnel client \
+  -server tunnel.example.com:7727 \
+  -pass "$CLIENT_SECRET" \
+  -name home-server \
+  -tls-ca ca.crt \
+  -tls-server-name tunnel.example.com
 ```
 
-Options:
-- `-port`: Server tunnel listening port (default: 7727)
-- `-panel-port`: Web management panel port (default: 7726)
-- `-password`: Authentication password
-- `-config`: Path to config file for persistence (optional)
-- `-debug`: Enable debug logging
+For a certificate issued by a public CA, omit `-tls-ca` and provide
+`-tls-server-name`. Supplying either client TLS option enables TLS verification.
+The server must receive both `-tls-cert` and `-tls-key` to enable TLS.
 
-Note: Without `-config`, the server starts with default in-memory configuration (no persistence). With `-config config.json`, the server will load/create and persist configuration changes.
+Without these TLS flags, the control connection remains plaintext for backward
+compatibility. Authentication does not encrypt tunnel traffic by itself.
 
-#### Web Panel
-
-Access the management panel at `http://localhost:7726` after starting the server.
-
-Default credentials:
-- Password: Use the `-password` flag value
-
-Features:
-- View connected clients and active tunnels
-- Add new tunnel mappings
-- Remove existing tunnels
-- Real-time status updates
-- **Server Logs Section**:
- - Real-time view of all server events
- - Filter logs by level (All/Info/Warning/Error)
- - Clear in-memory logs with one click
- - Auto-updates every 2 seconds (no auto-scroll, manual scrolling allowed)
- - Logs show: client connections, PING/PONG keepalive, tunnel events, stream lifecycle
-
-### Client Mode
-
-Connect to a server:
+The legacy form below still works, but gives clients and administrators the same
+secret:
 
 ```bash
-./gotunnel client -server example.com:7727 -pass MyPassword -name my-pc
+./gotunnel server -password "$SHARED_SECRET"
 ```
 
-Options:
-- `-server`: Server address in host:port format (required)
-- `-pass`: Authentication password (required)
-- `-name`: Machine identifier (required)
-- `-debug`: Enable debug logging
-- `-verbose`: Enable verbose output
+## Server options
 
-The client will automatically reconnect if the connection drops, with a 5-second backoff interval.
+```text
+-port int                 Control listener port (default 7727)
+-panel-host string        Web listener address (default "0.0.0.0")
+-panel-port int           Web listener port (default 7726)
+-client-password string   Required client credential
+-admin-password string    Required web-panel credential
+-password string          Legacy fallback for both credentials
+-tls-cert string          Control-connection certificate
+-tls-key string           Control-connection private key
+-config string            Optional configuration file for persistence
+-debug                    Enable debug logging
+-register                 Register a systemd service
+-unregister               Remove the systemd service
+```
+
+The server currently requires credentials at startup, even when an existing
+configuration file contains stored values. Prefer the separate password flags.
+
+## Client options
+
+```text
+-server string            Server control address (default "localhost:7727")
+-pass string              Client credential (required)
+-name string              Unique machine name (required)
+-tls-ca string            Optional PEM CA bundle; enables TLS
+-tls-server-name string   Certificate DNS name; enables TLS
+-reconnect-interval int   Initial reconnect delay in seconds (default 5)
+-debug                    Enable debug logging
+-register                 Register a systemd service
+-unregister               Remove the systemd service
+```
 
 ## Configuration
 
-### Configuration File Format
-
-When using `-config config.json`, the configuration is stored in JSON format:
+Tunnel changes made through the web panel are persisted to JSON. A representative
+file is:
 
 ```json
 {
- "server": {
- "port": 7727,
- "panel_port": 7726,
- "password": "MyPassword"
- },
- "machines": {
- "machine-name": {
- "tunnels": [
- {
- "remote": 8001,
- "local": 3000
- }
- ]
- }
- }
+  "server": {
+    "port": 7727,
+    "panel_host": "127.0.0.1",
+    "panel_port": 7726,
+    "client_password": "replace-with-client-secret",
+    "admin_password": "replace-with-admin-secret"
+  },
+  "machines": {
+    "home-server": {
+      "tunnels": [
+        {
+          "remote": 2222,
+          "local": 22
+        }
+      ]
+    }
+  }
 }
 ```
 
-### Configuration Management
+The program writes configuration atomically and restricts the file to mode
+`0600`. Loading an older file with a single `password` field migrates that value
+to both credential fields. Startup flags set the active credentials and persist
+them on the next save.
 
-- **Server Port**: Public port where the server listens for client connections
-- **Panel Port**: Port for the web management interface
-- **Password**: Authentication password for all clients
-- **Machines**: Map of connected machines and their tunnel configurations
- - **Remote Port**: Public port on the server
- - **Local Port**: Port on the client machine where the service runs
+Treat the configuration file and service unit as secrets. Command-line arguments
+may also be visible to privileged local users through process inspection.
 
-## Examples
+## Web panel
 
-### Example 1: Expose a Local Web Server
+Open `http://127.0.0.1:7726` when running locally and sign in with the
+administrator password. The panel can create and remove tunnels and shows
+connected clients, active tunnels, runtime health, and recent logs.
 
-Machine: laptop
-Local service: Web server running on localhost:3000
-Public access: Through server port 8001
+The panel serves HTTP directly. For remote administration, bind it to loopback
+with `-panel-host 127.0.0.1` and expose it through an HTTPS reverse proxy. The
+panel only trusts forwarded HTTPS information from loopback proxy connections;
+this allows its session cookie to receive the `Secure` attribute without trusting
+arbitrary client headers.
 
-Server:
-```bash
-./gotunnel server -port 7727 -panel-port 7726 -password secure123 -config config.json
-```
+Do not confuse the web reverse proxy with the tunnel transport. A conventional
+HTTP proxy protects the panel, while the server-client control port uses its own
+optional TLS configuration.
 
-Client:
-```bash
-./gotunnel client -server example.com:7727 -pass secure123 -name laptop
-```
+## Operating limits and failure behavior
 
-Then add tunnel via web panel:
-- Server Port (public): 8001
-- Service Port (private): 3000
+The default limits are deliberately conservative:
 
-External users can access the web server at: `http://example.com:8001`
+| Resource | Default |
+| --- | ---: |
+| Active streams per client | 100 |
+| Concurrent pending local dials | 50 |
+| Queued messages per stream | 50 |
+| Maximum control message | 10 MiB |
+| Authentication deadline | 10 seconds |
+| Simultaneous unauthenticated connections | 64 |
+| Server heartbeat interval | 10 seconds |
+| Client control-read timeout | 20 seconds |
+| Missed heartbeats before server cleanup | 3 |
 
-### Example 2: Expose Multiple Services
+When a per-stream queue fills, only that stream is closed. When a control
+connection becomes stale, all of its streams are closed and the client reconnects.
+Existing TCP sessions are not replayed or resumed after reconnect; applications
+must open new connections.
 
-Machine: home-server
-Local services:
-- SSH on localhost:22
-- Web UI on localhost:8080
-- API on localhost:5000
+A graceful server shutdown stops accepting new work and closes the web server,
+clients, streams, and listeners. Active HTTP and tunneled requests can be
+interrupted during shutdown; process death, host failure, or a network partition
+also interrupts traffic immediately.
 
-Client:
-```bash
-./gotunnel client -server example.com:7727 -pass secure123 -name home-server
-```
+## systemd services
 
-Add tunnels via web panel:
-- Server 2222 -> Service 22 (SSH)
-- Server 8080 -> Service 8080 (Web UI)
-- Server 5000 -> Service 5000 (API)
-
-External users can:
-- SSH: `ssh user@example.com -p 2222`
-- Web: `http://example.com:8080`
-- API: `http://example.com:5000`
-
-## Logging
-
-GoTunnel maintains comprehensive logs for all server events:
-
-### Log Locations
-
-1. **Terminal Output**: Real-time logs printed to stdout
-2. **Web Panel**: Real-time logs visible in the browser at `http://server:7726`
-3. **File**: Permanent audit trail at `logs/gotunnel.log`
-
-### Logged Events
-
-- Server startup/shutdown
-- Client connections and disconnections
-- Tunnel listener start/stop
-- Stream lifecycle (open, ready, close)
-- PING/PONG keepalive messages
-- Failed login attempts (rate limiting triggers)
-
-### Log Levels
-
-- **INFO**: Normal server operations
-- **WARNING**: Potentially problematic situations
-- **ERROR**: Errors and failures
-
-### Log File Format
-
-Logs are stored in `logs/gotunnel.log` with the format:
-```
-[2026-09-15 22:39:11] INFO: Stream 1 opened for port 7777 (local: 8090)
-```
-
-### Web Panel Log Features
-
-- Real-time display (updates every 2 seconds)
-- Filter by log level without affecting file logs
-- Clear in-memory logs (file logs persist)
-- Manual scrolling (logs don't auto-scroll)
-- Recent 1000 entries kept in memory
-
-## Production Deployment
-
-GoTunnel has been thoroughly tested and is **production-ready** for self-hosted reverse tunneling scenarios.
-
-### Deployment Checklist
-
-```
-□ Use strong password (20+ characters, mix of uppercase/lowercase/numbers/symbols)
-□ Deploy on a dedicated VPS or cloud instance
-□ Set up Cloudflare or reverse proxy for TLS encryption
-□ Enable firewall rules to restrict access to tunnel port
-□ Configure systemd service for auto-restart: ./gotunnel server -register
-□ Set up log rotation for logs/gotunnel.log
-□ Monitor Cloudflare/proxy logs for suspicious activity
-□ Test reconnection scenarios before full deployment
-□ Set up automated backups of config.json
-□ Consider redundant server setup for high-availability
-```
-
-### Recommended Use Cases
-
- **Well-Suited For**:
-- Internal corporate reverse tunneling
-- Exposing services on machines behind NAT/firewalls
-- Low-to-moderate traffic scenarios (<1000 concurrent connections)
-- Intranet services (SSH, web apps, APIs)
-- Development and staging environments
-- Remote office access to internal services
-
- **Requires Additional Setup**:
-- High-traffic scenarios (100K+ concurrent streams): consider load balancing
-- Mission-critical 24/7 systems: implement health checks and failover
-- Large file transfers: test throughput and adjust message size limits
-
-### Performance Expectations
-
-- **Latency**: <50ms with Cloudflare, <10ms on same network
-- **Throughput**: Limited by bandwidth and connection limits
-- **Concurrent Streams**: Up to 100 per client (configurable)
-- **Memory**: ~100KB per active stream
-
-### Monitoring
-
-Monitor these metrics in production:
-- Server logs for connection errors or stream failures
-- Cloudflare analytics for DDoS/bot activity
-- System resources (CPU, memory, file descriptors)
-- Failed login attempts in web panel
-- Client reconnection frequency (indicates network instability)
-
-## Security Considerations
-
-### Basic Security
-
-- Always use a strong password (20+ characters recommended)
-- Run the server on a machine with restricted firewall rules
-- Regularly update the password if multiple users have access
-- Monitor the web panel for unauthorized tunnel additions
-- Monitor logs for failed login attempts and suspicious activity
-- Use rate limiting on the server side to prevent brute force attacks
-
-### Production Deployment with Cloudflare (Recommended)
-
-GoTunnel is **production-ready** when deployed behind Cloudflare for maximum security:
-
-**Setup**:
-```bash
-# Server runs on internal network
-./gotunnel server -port 7727 -panel-port 7726 -password "strong-password" -config config.json
-
-# Point your domain to Cloudflare
-# example.com CNAME → your-tunnel.pages.cloudflare.com
-```
-
-**Cloudflare Configuration**:
-- Enable **Full (strict)** SSL/TLS mode
-- Enable **HSTS** (Strict-Transport-Security)
-- Set **Security Level: High**
-- Enable **Bot Management** to prevent automated attacks
-- Add **WAF rules** to block automated tools on `/api/*` paths
-- Configure **Rate Limiting**: 100 requests/minute per IP
-
-**Benefits**:
-- TLS 1.3 / HTTP/3 encryption (client Cloudflare)
-- DDoS protection and bot detection
-- WAF rules prevent malicious patterns
-- Geographic routing and performance optimization
-- Defense-in-depth security (password + CF auth)
-
-### Alternative: Reverse Proxy Setup
-
-If not using Cloudflare, run behind a reverse proxy (nginx, caddy, Traefik):
-```nginx
-server {
- listen 443 ssl http2;
- server_name example.com;
-
- ssl_certificate /path/to/cert.pem;
- ssl_certificate_key /path/to/key.pem;
- ssl_protocols TLSv1.2 TLSv1.3;
-
- location / {
- proxy_pass http://localhost:7726;
- proxy_set_header Host $host;
- }
-}
-```
-
-## Troubleshooting
-
-### Client Connection Issues
-
-**Problem**: Client fails to connect
-- Check server is running: `netstat -tuln | grep 7727`
-- Verify password matches
-- Check firewall rules on server machine
-- Verify correct server address and port
-- Check server logs for authentication errors
-
-**Problem**: Keepalive timeout messages
-- These are normal every 30 seconds
-- Indicates PING/PONG keepalive is working
-- Check logs for "Sent PING" and "Received PONG" messages
-
-### Web Panel Issues
-
-**Problem**: Web panel shows "Server Offline"
-- Check server is running
-- Verify panel port (default 7726)
-- Check firewall allows access to panel port
-- Try refreshing the browser
-
-**Problem**: Web panel login fails
-- Verify password is correct (case-sensitive)
-- Check for rate limiting: 5 failed attempts lock out IP for 15 minutes
-- Check server logs for failed login attempts
-
-**Problem**: Logs not appearing in web panel
-- Logs update every 2 seconds - wait briefly
-- Check server logs (terminal or file) to verify events are being logged
-- Try clearing logs and creating new events (add tunnel, connect client)
-
-### Tunnel Not Working
-
-**Problem**: External connection to tunnel port fails
-- Verify tunnel was added through web panel
-- Check local service is running on the specified port
-- Verify client is connected (shows in web panel)
-- Check server firewall allows traffic to tunnel port
-- Check logs for stream open/close events to diagnose issues
-
-## Service Management
-
-### Running as a System Service
-
-GoTunnel can be registered as a system-wide systemd service for automatic startup and management. **Service registration requires root privileges.**
-
-#### Registering the Server as a Service
+Registration requires root because it writes to `/etc/systemd/system`:
 
 ```bash
-sudo ./gotunnel server -port 7727 -panel-port 7726 -password "YourPassword" -register
+sudo ./gotunnel server \
+  -client-password "$CLIENT_SECRET" \
+  -admin-password "$ADMIN_SECRET" \
+  -config /var/lib/gotunnel/config.json \
+  -register
+
+sudo ./gotunnel client \
+  -server tunnel.example.com:7727 \
+  -pass "$CLIENT_SECRET" \
+  -name home-server \
+  -tls-ca /var/lib/gotunnel/ca.crt \
+  -tls-server-name tunnel.example.com \
+  -register
 ```
 
-This will:
-- Create `/etc/systemd/system/gotunnel-server.service` with your exact configuration
-- Preserve all command-line arguments
-- Enable automatic startup on system boot
-- Enable automatic restart on failure
+The generated unit uses `DynamicUser`, a persistent `/var/lib/gotunnel` state
+directory, a restricted filesystem view, a private temporary directory, and only
+the capability needed to bind privileged ports. The unit file is mode `0600`
+because it contains command-line credentials.
 
-#### Registering the Client as a Service
+Use absolute paths for configuration and TLS files. Files must be readable by the
+dynamic service identity. If your certificate-key policy cannot grant that access,
+maintain a custom unit that supplies the key through your platform's credential
+facility.
 
-```bash
-sudo ./gotunnel client -server example.com:7727 -pass "YourPassword" -name "my-machine" -register
-```
-
-#### Service Management Commands
-
-After registration, manage the service with:
+Manage the services normally:
 
 ```bash
-# Start the service
-sudo systemctl start gotunnel-server.service
-
-# Stop the service
-sudo systemctl stop gotunnel-server.service
-
-# Restart the service
-sudo systemctl restart gotunnel-server.service
-
-# Check service status
-sudo systemctl status gotunnel-server.service
-
-# View live logs
-journalctl -u gotunnel-server.service -f
-
-# Enable/disable auto-start
-sudo systemctl enable gotunnel-server.service
-sudo systemctl disable gotunnel-server.service
-```
-
-#### Unregistering a Service
-
-```bash
+sudo systemctl status gotunnel-server
+sudo journalctl -u gotunnel-server -f
 sudo ./gotunnel server -unregister
-# or
-sudo ./gotunnel client -unregister
 ```
 
-This will:
-- Stop the service if running
-- Disable auto-start
-- Remove the service file from `/etc/systemd/system/`
+The built-in client unit is named `gotunnel-client`. Register one client per host
+with this mechanism; multiple client instances require separately maintained unit
+names.
 
-**Note**: Direct terminal usage is always available. Registration creates a system-wide service; you can still run the binary directly from the terminal at any time:
+## Monitoring
+
+The authenticated `/api/status` endpoint includes:
+
+- server uptime and Go runtime version
+- goroutine count and allocated memory
+- connected clients and active tunnels
+- dropped in-memory log entries
+
+The metrics are process-local and reset after restart. GoTunnel does not yet
+export Prometheus metrics or distributed traces.
+
+## Current limits
+
+- One server instance owns all active clients and tunnel listeners; there is no
+  clustering, failover, or shared configuration.
+- Active streams do not survive a client reconnect.
+- Only TCP forwarding is supported.
+- The custom control protocol has no negotiated version for rolling upgrades.
+- TLS for the control connection is optional, and the web panel needs an external
+  HTTPS proxy for encryption.
+- Credentials are supplied through flags/configuration rather than a secret
+  manager, and there is no credential rotation protocol.
+- Logging and metrics are local; there is no audit-log or alerting integration.
+
+These are product and deployment limitations rather than known data races or
+unbounded-resource bugs. They define the main work needed before treating the
+project as a multi-tenant or highly available service.
+
+## Development and verification
+
+Run the complete local checks with:
 
 ```bash
-./gotunnel server -port 7727 -password "MyPassword"
-./gotunnel client -server example.com:7727 -pass "MyPassword" -name "my-pc"
+gofmt -l .
+go vet ./...
+go test -race ./...
+go build ./...
+git diff --check
 ```
 
-## Performance
-
-GoTunnel is designed for moderate traffic volumes. Each active connection consumes:
-- One goroutine for reading
-- One goroutine for each stream
-- Memory for buffering data between connections
-
-Typical memory usage: 10-50MB per 100 concurrent streams.
-
-## Project Structure
-
-```
-GoTunnel/
- main.go - Entry point, CLI parsing
- internal/
-  server/
-      server.go - Main server logic
-      connection.go - Client connection handling
-      web.go - Web API and panel serving
-  web/
-      index.html - Web panel UI
-      style.css - Styling
-      app.js - Frontend logic
-  client/
-      client.go - Client connection logic
-  config/
-      config.go - Configuration management
-  auth/
-      auth.go - Authentication logic
-  protocol/
-      protocol.go - Message encoding/decoding
-```
-
-## Development
-
-### Building
-
-```bash
-go build -o gotunnel .
-```
-
-### Running with Debug Output
-
-```bash
-./gotunnel server -debug
-./gotunnel client -server localhost:7727 -pass MyPassword -name test -debug
-```
-
-### Testing
-
-```bash
-go test ./...
-```
+The test suite covers protocol validation, configuration migration, bounded
+queues and dials, TLS control connections, concurrent traffic, slow local targets,
+reconnect cleanup, half-close behavior, web security, service registration, and
+graceful shutdown.
 
 ## License
 
 MIT
-
-## Support
-
-For issues, questions, or contributions, please refer to the project repository.

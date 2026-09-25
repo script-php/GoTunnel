@@ -10,9 +10,12 @@ import (
 
 // ServerConfig holds server configuration
 type ServerConfig struct {
-	Port      int    `json:"port"`
-	PanelPort int    `json:"panel_port"`
-	Password  string `json:"password"`
+	Port           int    `json:"port"`
+	PanelPort      int    `json:"panel_port"`
+	PanelHost      string `json:"panel_host,omitempty"`
+	Password       string `json:"password,omitempty"` // Legacy migration only.
+	ClientPassword string `json:"client_password,omitempty"`
+	AdminPassword  string `json:"admin_password,omitempty"`
 }
 
 // TunnelConfig represents a single port mapping
@@ -79,6 +82,12 @@ func (m *Manager) Load() error {
 	}
 	if cfg.Machines == nil {
 		cfg.Machines = make(map[string]MachineConfig)
+	}
+	if cfg.Server.ClientPassword == "" {
+		cfg.Server.ClientPassword = cfg.Server.Password
+	}
+	if cfg.Server.AdminPassword == "" {
+		cfg.Server.AdminPassword = cfg.Server.Password
 	}
 	m.cfg = cfg
 	return nil
@@ -178,10 +187,42 @@ func (m *Manager) SetServerPassword(password string) error {
 	}
 
 	m.cfg.Server.Password = password
+	m.cfg.Server.ClientPassword = password
+	m.cfg.Server.AdminPassword = password
 
 	// Only save if using a config file
 	if m.path != "" {
 		return m.saveLocked()
+	}
+	return nil
+}
+
+func (m *Manager) SetClientPassword(password string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.cfg == nil {
+		return fmt.Errorf("configuration not initialized")
+	}
+	previous := m.cfg.Server.ClientPassword
+	m.cfg.Server.ClientPassword = password
+	if err := m.saveLocked(); err != nil {
+		m.cfg.Server.ClientPassword = previous
+		return err
+	}
+	return nil
+}
+
+func (m *Manager) SetAdminPassword(password string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.cfg == nil {
+		return fmt.Errorf("configuration not initialized")
+	}
+	previous := m.cfg.Server.AdminPassword
+	m.cfg.Server.AdminPassword = password
+	if err := m.saveLocked(); err != nil {
+		m.cfg.Server.AdminPassword = previous
+		return err
 	}
 	return nil
 }
@@ -330,7 +371,7 @@ func (m *Manager) getDefaultConfig() *Config {
 		Server: ServerConfig{
 			Port:      7727,
 			PanelPort: 7726,
-			Password:  "",
+			PanelHost: "0.0.0.0",
 		},
 		Machines: make(map[string]MachineConfig),
 	}
@@ -379,6 +420,25 @@ func (m *Manager) SetPanelPort(port int) error {
 	return nil
 }
 
+// SetPanelHost sets the address used by the management panel listener.
+func (m *Manager) SetPanelHost(host string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.cfg == nil {
+		return fmt.Errorf("configuration not initialized")
+	}
+	if host == "" {
+		return fmt.Errorf("panel host cannot be empty")
+	}
+	previous := m.cfg.Server.PanelHost
+	m.cfg.Server.PanelHost = host
+	if err := m.saveLocked(); err != nil {
+		m.cfg.Server.PanelHost = previous
+		return err
+	}
+	return nil
+}
+
 // cloneMachine prevents callers from mutating configuration outside the manager lock.
 func cloneMachine(machine MachineConfig) MachineConfig {
 	if machine.Tunnels != nil {
@@ -397,6 +457,9 @@ func validate(cfg *Config) error {
 	if cfg.Server.PanelPort == cfg.Server.Port {
 		return fmt.Errorf("server and panel ports must differ")
 	}
+	if cfg.Server.PanelHost == "" {
+		return fmt.Errorf("panel host cannot be empty")
+	}
 	owners := make(map[int]string)
 	for id, machine := range cfg.Machines {
 		if err := validateMachine(id, machine, cfg.Server, owners); err != nil {
@@ -407,8 +470,8 @@ func validate(cfg *Config) error {
 }
 
 func validateMachine(id string, machine MachineConfig, server ServerConfig, owners map[int]string) error {
-	if id == "" {
-		return fmt.Errorf("machine ID cannot be empty")
+	if err := ValidateMachineID(id); err != nil {
+		return err
 	}
 	for _, tunnel := range machine.Tunnels {
 		if tunnel.Remote < 1 || tunnel.Remote > 65535 || tunnel.Local < 1 || tunnel.Local > 65535 {
@@ -423,6 +486,21 @@ func validateMachine(id string, machine MachineConfig, server ServerConfig, owne
 			}
 			owners[tunnel.Remote] = id
 		}
+	}
+	return nil
+}
+
+// ValidateMachineID keeps identifiers safe for logs and URL path segments.
+func ValidateMachineID(id string) error {
+	if id == "" || len(id) > 128 {
+		return fmt.Errorf("machine ID must contain 1 to 128 characters")
+	}
+	for _, char := range id {
+		if (char >= 'a' && char <= 'z') || (char >= 'A' && char <= 'Z') ||
+			(char >= '0' && char <= '9') || char == '-' || char == '_' || char == '.' {
+			continue
+		}
+		return fmt.Errorf("machine ID contains unsupported character %q", char)
 	}
 	return nil
 }

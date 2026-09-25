@@ -5,6 +5,9 @@ import (
 	"github.com/yoyo/gotunnel/internal/protocol"
 	"github.com/yoyo/gotunnel/internal/tunnel"
 	"net"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 )
@@ -15,6 +18,7 @@ func TestStreamWriteFailureDoesNotDeadlock(t *testing.T) {
 	peer.Close()
 	stream := tunnel.NewStream(1, local, nil)
 	c := &ClientConnection{streams: map[uint32]*tunnel.Stream{1: stream}}
+	stream.StartWriter(time.Second, func(error) { c.closeStream(1) })
 	done := make(chan struct{})
 	go func() {
 		c.handleStreamData(protocol.MessageStreamData{StreamID: 1, Data: []byte("hello")})
@@ -25,11 +29,28 @@ func TestStreamWriteFailureDoesNotDeadlock(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("write failure deadlocked cleanup")
 	}
-	if !stream.IsClosed() {
-		t.Fatal("failed stream remains open")
+	deadline := time.Now().Add(time.Second)
+	for !stream.IsClosed() && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
 	}
-	if len(c.streams) != 0 {
+	if !stream.IsClosed() || len(c.streams) != 0 {
 		t.Fatal("failed stream remains registered")
+	}
+}
+
+func TestClientIPTrustsForwardedHeaderOnlyFromLoopback(t *testing.T) {
+	local := httptest.NewRequest("POST", "/api/login", nil)
+	local.RemoteAddr = "127.0.0.1:1234"
+	local.Header.Set("X-Forwarded-For", "203.0.113.4")
+	if got := requestClientIP(local); got != "203.0.113.4" {
+		t.Fatalf("trusted proxy IP = %q", got)
+	}
+
+	remote := httptest.NewRequest("POST", "/api/login", nil)
+	remote.RemoteAddr = "198.51.100.7:1234"
+	remote.Header.Set("X-Forwarded-For", "203.0.113.4")
+	if got := requestClientIP(remote); got != "198.51.100.7" {
+		t.Fatalf("untrusted forwarded IP = %q", got)
 	}
 }
 
@@ -141,5 +162,56 @@ func TestLoggerCloseIsIdempotent(t *testing.T) {
 	l.Add("INFO", "after close")
 	if got := l.Count(); got != 1 {
 		t.Fatalf("log count after close = %d, want 1", got)
+	}
+}
+
+func TestLoggerRotatesOversizedFileOnStartup(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "gotunnel.log")
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Truncate(DefaultMaxLogSize + 1); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+
+	l := NewLogger(path, 10)
+	l.Add("INFO", "new log")
+	if err := l.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(path + ".1"); err != nil {
+		t.Fatalf("rotated log missing: %v", err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Size() >= DefaultMaxLogSize {
+		t.Fatalf("active log was not reset: %d bytes", info.Size())
+	}
+}
+
+func TestClientAndAdminCredentialsAreSeparate(t *testing.T) {
+	cfg := config.NewManager("")
+	cfg.InitDefault()
+	if err := cfg.SetClientPassword("client-only"); err != nil {
+		t.Fatal(err)
+	}
+	if err := cfg.SetAdminPassword("admin-only"); err != nil {
+		t.Fatal(err)
+	}
+	s := NewServer(cfg)
+	if err := s.authenticator.Authenticate("client-only"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.authenticator.Authenticate("admin-only"); err == nil {
+		t.Fatal("admin credential authenticated as a tunnel client")
+	}
+	ws := NewWebServer("127.0.0.1", 0, cfg.GetServerConfig().AdminPassword)
+	defer ws.logger.Close()
+	if ws.password != "admin-only" {
+		t.Fatal("web panel did not receive the admin credential")
 	}
 }

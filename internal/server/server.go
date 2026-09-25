@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"log"
@@ -59,6 +60,8 @@ type Server struct {
 	shutdownMu   sync.Mutex
 	stopOnce     sync.Once
 	stopErr      error
+	startedAt    time.Time
+	tlsConfig    *tls.Config
 }
 
 // LoggerInterface defines logging methods
@@ -71,14 +74,28 @@ func NewServer(cfgMgr *config.Manager) *Server {
 	serverCfg := cfgMgr.GetServerConfig()
 	return &Server{
 		cfgMgr:          cfgMgr,
-		authenticator:   auth.NewAuthenticator(serverCfg.Password),
+		authenticator:   auth.NewAuthenticator(serverCfg.ClientPassword),
 		clients:         make(map[string]*ClientConnection),
 		portMap:         make(map[int]string),
 		tunnelListeners: make(map[int]net.Listener),
 		pendingAuth:     make(chan struct{}, MaxPendingAuthentications),
 		stopCh:          make(chan struct{}),
 		doneCh:          make(chan struct{}),
+		startedAt:       time.Now(),
 	}
+}
+
+// EnableTLS configures encrypted client transport using a certificate pair.
+func (s *Server) EnableTLS(certFile, keyFile string) error {
+	certificate, err := tls.LoadX509KeyPair(certFile, keyFile)
+	if err != nil {
+		return fmt.Errorf("load TLS certificate: %w", err)
+	}
+	s.tlsConfig = &tls.Config{
+		Certificates: []tls.Certificate{certificate},
+		MinVersion:   tls.VersionTLS13,
+	}
+	return nil
 }
 
 // SetLogger sets the logger for the server
@@ -127,6 +144,9 @@ func (s *Server) Start() error {
 	if err != nil {
 		return fmt.Errorf("failed to start server listener: %w", err)
 	}
+	if s.tlsConfig != nil {
+		listener = tls.NewListener(listener, s.tlsConfig)
+	}
 
 	s.listener = listener
 
@@ -138,7 +158,7 @@ func (s *Server) Start() error {
 
 	// Start web panel
 	if serverCfg.PanelPort > 0 {
-		if err := s.StartWebPanel(serverCfg.PanelPort); err != nil {
+		if err := s.StartWebPanel(serverCfg.PanelHost, serverCfg.PanelPort); err != nil {
 			s.logEvent("ERROR", fmt.Sprintf("Failed to start web panel: %v", err))
 		}
 	}

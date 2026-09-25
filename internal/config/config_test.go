@@ -92,3 +92,32 @@ func TestSavedConfigUsesPrivatePermissions(t *testing.T) {
 		t.Fatalf("config permissions = %o, want 600", got)
 	}
 }
+
+func TestValidateMachineID(t *testing.T) {
+	for _, valid := range []string{"machine", "home-server_1", "office.pc"} {
+		if err := ValidateMachineID(valid); err != nil {
+			t.Fatalf("ValidateMachineID(%q): %v", valid, err)
+		}
+	}
+	for _, invalid := range []string{"", "name/segment", "name' onclick='x", "machine name"} {
+		if err := ValidateMachineID(invalid); err == nil {
+			t.Fatalf("ValidateMachineID(%q) unexpectedly succeeded", invalid)
+		}
+	}
+}
+
+func TestLegacyPasswordMigratesToSeparateCredentials(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	data := `{"server":{"port":7727,"panel_port":7726,"password":"legacy"}}`
+	if err := os.WriteFile(path, []byte(data), 0600); err != nil {
+		t.Fatal(err)
+	}
+	m := NewManager(path)
+	if err := m.Load(); err != nil {
+		t.Fatal(err)
+	}
+	server := m.GetServerConfig()
+	if server.ClientPassword != "legacy" || server.AdminPassword != "legacy" {
+		t.Fatalf("legacy credentials were not migrated: %#v", server)
+	}
+}

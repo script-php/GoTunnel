@@ -116,7 +116,7 @@ class DashboardApp {
                         <div style="font-size: 0.85rem; color: var(--secondary);">
                             ${client.streams ? client.streams.length : 0} active stream(s)
                         </div>
-                        <button class="client-edit-btn" onclick="window.app.openModal('${machineId}')">Edit</button>
+                        <button class="client-edit-btn" data-client="${encodeURIComponent(machineId)}">Edit</button>
                     </div>
                 </div>
                 <div class="client-tunnels">
@@ -130,6 +130,9 @@ class DashboardApp {
                 </div>
             </div>
         `).join('');
+        clientsList.querySelectorAll('.client-edit-btn').forEach(button => {
+            button.addEventListener('click', () => this.openModal(decodeURIComponent(button.dataset.client)));
+        });
     }
 
     renderTunnels(status) {
@@ -208,7 +211,7 @@ class DashboardApp {
 
     async loadClientTunnels(clientId) {
         try {
-            const response = await fetch(`${this.apiBase}/client/${clientId}`);
+            const response = await fetch(`${this.apiBase}/client/${encodeURIComponent(clientId)}`);
             if (!response.ok) throw new Error('Failed to load client');
             
             const data = await response.json();
@@ -227,9 +230,14 @@ class DashboardApp {
                         <span style="color: var(--secondary);">Service:${tunnel.local}</span>
                     </div>
                     <div></div>
-                    <button class="edit-tunnel-delete" onclick="window.app.removeTunnel('${clientId}', ${tunnel.remote})">Delete</button>
+                    <button class="edit-tunnel-delete" data-client="${encodeURIComponent(clientId)}" data-port="${tunnel.remote}">Delete</button>
                 </div>
             `).join('');
+            tunnelsList.querySelectorAll('.edit-tunnel-delete').forEach(button => {
+                button.addEventListener('click', () => {
+                    this.removeTunnel(decodeURIComponent(button.dataset.client), Number(button.dataset.port));
+                });
+            });
         } catch (error) {
             console.error('Failed to load client tunnels:', error);
             document.getElementById('editTunnelsList').innerHTML = '<div class="empty-state">Error loading tunnels</div>';
@@ -251,7 +259,7 @@ class DashboardApp {
         }
 
         try {
-            const response = await fetch(`${this.apiBase}/client/${this.selectedClient}/tunnel`, {
+            const response = await fetch(`${this.apiBase}/client/${encodeURIComponent(this.selectedClient)}/tunnel`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ remote: remotePort, local: localPort })
@@ -283,7 +291,7 @@ class DashboardApp {
         }
 
         try {
-            const response = await fetch(`${this.apiBase}/client/${clientId}/tunnel/${remotePort}`, {
+            const response = await fetch(`${this.apiBase}/client/${encodeURIComponent(clientId)}/tunnel/${remotePort}`, {
                 method: 'DELETE'
             });
 

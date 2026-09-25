@@ -40,3 +40,18 @@ func TestReadFramesAndTruncation(t *testing.T) {
 		}
 	}
 }
+
+func TestHalfCloseRoundTrip(t *testing.T) {
+	frame, err := Encode(&Message{Type: MessageTypeStreamClose, Payload: MessageStreamClose{StreamID: 9, HalfClose: true}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	msg, err := Read(bytes.NewReader(frame))
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := msg.Payload.(MessageStreamClose)
+	if payload.StreamID != 9 || !payload.HalfClose {
+		t.Fatalf("wrong half-close payload: %#v", payload)
+	}
+}
