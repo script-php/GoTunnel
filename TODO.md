@@ -31,6 +31,10 @@
 - [x] Improve log rotation/error reporting and expose health/resource metrics.
 - [x] Fix systemd argument quoting, working directory, and least-privilege execution.
 - [x] Implement or remove ignored CLI flags; align README with verified behavior.
+- [x] Add server health, tunnel bandwidth, and periodic client telemetry to the
+  authenticated admin panel.
+- [x] Add a persistent dark/light navbar switch, with a neutral dark theme as the
+  default across the admin panel and login screen.
 
 ## Verification
 - First pass: `go test -race ./...` passes, including stream write failures, replacement-client cleanup, closed listeners, oversized frames, and truncated frames.

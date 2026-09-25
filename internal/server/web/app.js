@@ -63,6 +63,7 @@ class DashboardApp {
         try {
             const status = await this.fetchStatus();
             this.renderStats(status);
+            this.renderHealth(status);
             this.renderClients(status);
             this.renderTunnels(status);
             await this.renderLogs();
@@ -92,8 +93,26 @@ class DashboardApp {
         document.getElementById('clientCount').textContent = clientCount;
         document.getElementById('tunnelCount').textContent = tunnels.length;
         document.getElementById('streamCount').textContent = streamCount;
+        document.getElementById('serverPort').textContent = status.metrics?.server_port ?? '--';
+        document.getElementById('panelVersion').textContent = status.version || 'unknown';
         
         this.setServerStatus(true);
+    }
+
+    renderHealth(status) {
+        const metrics = status.metrics || {};
+        document.getElementById('hostCpu').textContent = this.formatPercent(metrics.cpu_percent);
+        document.getElementById('processCpu').textContent = this.formatPercent(metrics.process_cpu_percent);
+        document.getElementById('hostMemory').textContent = metrics.memory_total_bytes
+            ? `${this.formatBytes(metrics.memory_used_bytes)} / ${this.formatBytes(metrics.memory_total_bytes)} (${this.formatPercent(metrics.memory_used_bytes * 100 / metrics.memory_total_bytes)})`
+            : 'Unavailable';
+        document.getElementById('processMemory').textContent = this.formatBytes(metrics.process_rss_bytes);
+        document.getElementById('downloadRate').textContent = `${this.formatBytes(metrics.download_bytes_per_sec)}/s`;
+        document.getElementById('downloadTotal').textContent = `${this.formatBytes(metrics.download_bytes)} total`;
+        document.getElementById('uploadRate').textContent = `${this.formatBytes(metrics.upload_bytes_per_sec)}/s`;
+        document.getElementById('uploadTotal').textContent = `${this.formatBytes(metrics.upload_bytes)} total`;
+        document.getElementById('serverUptime').textContent = this.formatDuration(metrics.uptime_seconds);
+        document.getElementById('goroutineCount').textContent = metrics.goroutines ?? '--';
     }
 
     renderClients(status) {
@@ -111,6 +130,7 @@ class DashboardApp {
                     <div class="client-name">
                         <span class="client-status"></span>
                         ${this.escapeHtml(machineId)}
+                        <span class="client-version">${this.escapeHtml(client.telemetry?.version || 'version unknown')}</span>
                     </div>
                     <div style="display: flex; gap: 1rem; align-items: center;">
                         <div style="font-size: 0.85rem; color: var(--secondary);">
@@ -119,6 +139,7 @@ class DashboardApp {
                         <button class="client-edit-btn" data-client="${encodeURIComponent(machineId)}">Edit</button>
                     </div>
                 </div>
+                ${this.renderClientTelemetry(client)}
                 <div class="client-tunnels">
                     ${(client.tunnels || []).map(tunnel => `
                         <div class="tunnel-badge">
@@ -133,6 +154,48 @@ class DashboardApp {
         clientsList.querySelectorAll('.client-edit-btn').forEach(button => {
             button.addEventListener('click', () => this.openModal(decodeURIComponent(button.dataset.client)));
         });
+    }
+
+    renderClientTelemetry(client) {
+        const telemetry = client.telemetry || {};
+        if (!telemetry.timestamp) {
+            return '<div class="telemetry-unavailable">Waiting for client telemetry…</div>';
+        }
+        const stale = client.telemetry_stale ? '<span class="telemetry-stale">Stale</span>' : '';
+        const memory = telemetry.memory_total_bytes
+            ? `${this.formatBytes(telemetry.memory_used_bytes)} / ${this.formatBytes(telemetry.memory_total_bytes)}`
+            : 'Unavailable';
+        return `<div class="client-telemetry">
+            <div><span>Host CPU</span><strong>${this.formatPercent(telemetry.cpu_percent)}</strong></div>
+            <div><span>Process CPU</span><strong>${this.formatPercent(telemetry.process_cpu_percent)}</strong></div>
+            <div><span>Host memory</span><strong>${memory}</strong></div>
+            <div><span>Process memory</span><strong>${this.formatBytes(telemetry.process_rss_bytes)}</strong></div>
+            <div><span>↓ Download</span><strong>${this.formatBytes(telemetry.download_bytes_per_sec)}/s</strong></div>
+            <div><span>↑ Upload</span><strong>${this.formatBytes(telemetry.upload_bytes_per_sec)}/s</strong></div>
+            <div><span>Uptime</span><strong>${this.formatDuration(telemetry.uptime_seconds)} ${stale}</strong></div>
+        </div>`;
+    }
+
+    formatBytes(value) {
+        const bytes = Number(value) || 0;
+        if (bytes < 1024) return `${bytes.toFixed(0)} B`;
+        const units = ['KiB', 'MiB', 'GiB', 'TiB'];
+        let amount = bytes;
+        let unit = -1;
+        do { amount /= 1024; unit++; } while (amount >= 1024 && unit < units.length - 1);
+        return `${amount.toFixed(amount >= 100 ? 0 : amount >= 10 ? 1 : 2)} ${units[unit]}`;
+    }
+
+    formatPercent(value) {
+        return `${(Number(value) || 0).toFixed(1)}%`;
+    }
+
+    formatDuration(value) {
+        let seconds = Math.max(0, Math.floor(Number(value) || 0));
+        const days = Math.floor(seconds / 86400); seconds %= 86400;
+        const hours = Math.floor(seconds / 3600); seconds %= 3600;
+        const minutes = Math.floor(seconds / 60);
+        return [days && `${days}d`, (hours || days) && `${hours}h`, `${minutes}m`].filter(Boolean).join(' ');
     }
 
     renderTunnels(status) {

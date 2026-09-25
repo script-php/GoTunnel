@@ -40,8 +40,12 @@ type ClientConnection struct {
 	missedPongs  int32 // Count of consecutive missed PONGs
 	pongMu       sync.Mutex
 
-	closed   bool
-	closedMu sync.Mutex
+	closed              bool
+	closedMu            sync.Mutex
+	writeMu             sync.Mutex
+	telemetryMu         sync.RWMutex
+	telemetry           protocol.MessageTelemetry
+	telemetryReceivedAt time.Time
 }
 
 // NewClientConnection creates a new client connection handler
@@ -317,6 +321,17 @@ func (cc *ClientConnection) Handle() {
 					}
 				}
 
+			case protocol.MessageTypeTelemetry:
+				payload, ok := msg.Payload.(protocol.MessageTelemetry)
+				if !ok {
+					log.Printf("Invalid TELEMETRY payload")
+					continue
+				}
+				cc.telemetryMu.Lock()
+				cc.telemetry = payload
+				cc.telemetryReceivedAt = time.Now()
+				cc.telemetryMu.Unlock()
+
 			default:
 				log.Printf("Unknown message type: %d", msg.Type)
 			}
@@ -457,6 +472,9 @@ func (cc *ClientConnection) forwardExternalToClient(streamID uint32) {
 
 		n, err := conn.Read(buf)
 		if n > 0 {
+			if cc.server != nil {
+				cc.server.downloadBytes.Add(uint64(n))
+			}
 			dataMsg := &protocol.Message{Type: protocol.MessageTypeStreamData, Payload: protocol.MessageStreamData{StreamID: streamID, Data: buf[:n]}}
 			if sendErr := cc.sendMessage(dataMsg); sendErr != nil {
 				log.Printf("Stream %d send error: %v", streamID, sendErr)
@@ -498,6 +516,9 @@ func (cc *ClientConnection) forwardExternalToClient(streamID uint32) {
 
 // handleStreamData handles incoming stream data from client
 func (cc *ClientConnection) handleStreamData(payload protocol.MessageStreamData) {
+	if cc.server != nil {
+		cc.server.uploadBytes.Add(uint64(len(payload.Data)))
+	}
 	cc.streamsMu.RLock()
 	stream, exists := cc.streams[payload.StreamID]
 	cc.streamsMu.RUnlock()
@@ -570,6 +591,8 @@ func (cc *ClientConnection) sendMessage(msg *protocol.Message) error {
 		return err
 	}
 
+	cc.writeMu.Lock()
+	defer cc.writeMu.Unlock()
 	if err := cc.conn.SetWriteDeadline(time.Now().Add(WriteTimeoutDuration)); err != nil {
 		return err
 	}

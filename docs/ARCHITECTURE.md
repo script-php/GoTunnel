@@ -12,6 +12,7 @@ stable under disconnects, slow endpoints, and concurrent shutdown.
 - `internal/client` maintains one control connection, reconnects after failures,
   and maps server stream requests to bounded local TCP dials.
 - `internal/protocol` validates length-prefixed JSON control messages.
+- `internal/systemmetrics` samples Linux host and process resource counters.
 - `internal/tunnel` copies TCP traffic in both directions and preserves ordered
   half-close behavior.
 - `internal/config` loads, migrates, validates, and atomically saves persistent
@@ -36,6 +37,11 @@ stable under disconnects, slow endpoints, and concurrent shutdown.
    Configured public listeners remain available and immediately reject new traffic
    while the machine is offline. The client retries with an exponentially
    increasing, jittered delay.
+
+While connected, the client sends a telemetry message every five seconds. It
+contains host and process CPU/memory values, uptime, active stream count, and
+tunnel byte totals/rates. The server records receipt time independently of the
+client clock and the panel marks telemetry stale after fifteen seconds.
 
 ## Ownership and concurrency
 

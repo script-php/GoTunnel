@@ -1,5 +1,9 @@
 # GoTunnel
 
+<p align="center">
+  <img src="media/gotunnel.png" alt="GoTunnel is a self-hosted TCP reverse tunnel written in Go." />
+</p>
+
 GoTunnel is a self-hosted TCP reverse tunnel written in Go. A client running
 behind NAT opens a long-lived control connection to the server. The server then
 accepts traffic on public tunnel ports and multiplexes those streams over that
@@ -51,6 +55,8 @@ closes the stream while leaving the client connection and other streams alive.
   checks, and security headers
 - Bounded in-memory logs and 10 MiB startup rotation for the log file
 - Runtime status metrics in the authenticated `/api/status` response
+- Five-second client telemetry for host/process CPU, memory, uptime, streams, and
+  tunnel bandwidth
 - Hardened systemd units with a dynamic service account and a private unit file
 
 ## Build
@@ -176,7 +182,9 @@ may also be visible to privileged local users through process inspection.
 
 Open `http://127.0.0.1:7726` when running locally and sign in with the
 administrator password. The panel can create and remove tunnels and shows
-connected clients, active tunnels, runtime health, and recent logs.
+connected clients, active tunnels, runtime health, and recent logs. The neutral
+dark theme is the default; a navbar control switches to light mode and remembers
+the browser's preference.
 
 The panel serves HTTP directly. For remote administration, bind it to loopback
 with `-panel-host 127.0.0.1` and expose it through an HTTPS reverse proxy. The
@@ -260,13 +268,18 @@ names.
 
 The authenticated `/api/status` endpoint includes:
 
-- server uptime and Go runtime version
-- goroutine count and allocated memory
+- server uptime, host/process CPU, host memory, process RSS, and goroutine count
 - connected clients and active tunnels
+- server upload/download totals and current transfer rates
+- per-client host/process CPU, memory, uptime, streams, bandwidth, and telemetry
+  freshness
+- server/panel and connected-client binary versions
 - dropped in-memory log entries
 
-The metrics are process-local and reset after restart. GoTunnel does not yet
-export Prometheus metrics or distributed traces.
+Traffic totals and rate samples are process-local and reset after restart. Host
+CPU and memory collection uses Linux `/proc`; unsupported systems report those
+fields as unavailable while Go runtime information continues to work. GoTunnel
+does not yet export Prometheus metrics or distributed traces.
 
 ## Current limits
 

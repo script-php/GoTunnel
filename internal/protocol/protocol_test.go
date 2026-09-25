@@ -55,3 +55,26 @@ func TestHalfCloseRoundTrip(t *testing.T) {
 		t.Fatalf("wrong half-close payload: %#v", payload)
 	}
 }
+
+func TestTelemetryRoundTrip(t *testing.T) {
+	want := MessageTelemetry{
+		Version: "v1.2.3", Timestamp: 1234, UptimeSeconds: 99, CPUPercent: 42.5,
+		MemoryUsedBytes: 1024, MemoryTotalBytes: 4096,
+		UploadBytes: 17, DownloadBytes: 23, ActiveStreams: 2,
+	}
+	frame, err := Encode(&Message{Type: MessageTypeTelemetry, Payload: want})
+	if err != nil {
+		t.Fatal(err)
+	}
+	msg, err := Read(bytes.NewReader(frame))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, ok := msg.Payload.(MessageTelemetry)
+	if !ok {
+		t.Fatalf("payload type = %T", msg.Payload)
+	}
+	if got.Version != want.Version || got.Timestamp != want.Timestamp || got.CPUPercent != want.CPUPercent || got.DownloadBytes != want.DownloadBytes {
+		t.Fatalf("telemetry = %+v, want %+v", got, want)
+	}
+}

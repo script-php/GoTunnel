@@ -4,18 +4,20 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>GoTunnel</title>
+    <script src="theme.js"></script>
     <link rel="stylesheet" href="style.css">
 </head>
 <body>
     <div class="container">
         <header class="header">
             <div class="header-content">
-                <h1>GoTunnel</h1>
+                <h1>GoTunnel <span class="version-badge" id="panelVersion">--</span></h1>
                 <div style="display: flex; align-items: center; gap: 1rem;">
                     <div class="status-badge" id="serverStatus">
                         <span class="status-indicator"></span>
                         Server Online
                     </div>
+                    <button class="theme-toggle" id="themeToggle" type="button">☀ Light</button>
                     <button class="btn btn-secondary" onclick="window.app.logout()" style="padding: 0.5rem 1rem; font-size: 0.85rem;">Logout</button>
                 </div>
             </div>
@@ -38,6 +40,20 @@
                 <div class="stat-card">
                     <div class="stat-label">Server Port</div>
                     <div class="stat-value" id="serverPort">7727</div>
+                </div>
+            </section>
+
+            <section class="health-section">
+                <h2>Server Health</h2>
+                <div class="health-grid">
+                    <div class="health-item"><span>Host CPU</span><strong id="hostCpu">--</strong></div>
+                    <div class="health-item"><span>GoTunnel CPU</span><strong id="processCpu">--</strong></div>
+                    <div class="health-item"><span>Host memory</span><strong id="hostMemory">--</strong></div>
+                    <div class="health-item"><span>GoTunnel memory</span><strong id="processMemory">--</strong></div>
+                    <div class="health-item"><span>Download</span><strong id="downloadRate">--</strong><small id="downloadTotal">-- total</small></div>
+                    <div class="health-item"><span>Upload</span><strong id="uploadRate">--</strong><small id="uploadTotal">-- total</small></div>
+                    <div class="health-item"><span>Uptime</span><strong id="serverUptime">--</strong></div>
+                    <div class="health-item"><span>Goroutines</span><strong id="goroutineCount">--</strong></div>
                 </div>
             </section>
 

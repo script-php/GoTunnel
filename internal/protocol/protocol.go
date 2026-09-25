@@ -48,6 +48,9 @@ const (
 	// Keep-alive
 	MessageTypePing
 	MessageTypePong
+
+	// Periodic client health and traffic information.
+	MessageTypeTelemetry
 )
 
 // Message is the base structure for all protocol messages
@@ -112,6 +115,23 @@ type MessagePing struct {
 // MessagePong - Keep-alive pong
 type MessagePong struct {
 	Timestamp int64 `json:"timestamp"`
+}
+
+type MessageTelemetry struct {
+	Version             string  `json:"version,omitempty"`
+	Timestamp           int64   `json:"timestamp"`
+	UptimeSeconds       int64   `json:"uptime_seconds"`
+	CPUPercent          float64 `json:"cpu_percent"`
+	ProcessCPUPercent   float64 `json:"process_cpu_percent"`
+	MemoryUsedBytes     uint64  `json:"memory_used_bytes"`
+	MemoryTotalBytes    uint64  `json:"memory_total_bytes"`
+	ProcessRSSBytes     uint64  `json:"process_rss_bytes"`
+	Goroutines          int     `json:"goroutines"`
+	ActiveStreams       int     `json:"active_streams"`
+	UploadBytes         uint64  `json:"upload_bytes"`
+	DownloadBytes       uint64  `json:"download_bytes"`
+	UploadBytesPerSec   float64 `json:"upload_bytes_per_sec"`
+	DownloadBytesPerSec float64 `json:"download_bytes_per_sec"`
 }
 
 // Encode serializes a message into bytes
@@ -227,6 +247,10 @@ func Decode(data []byte) (*Message, error) {
 			payload = msg
 		case MessageTypePong:
 			var msg MessagePong
+			err = json.Unmarshal(payloadBytes, &msg)
+			payload = msg
+		case MessageTypeTelemetry:
+			var msg MessageTelemetry
 			err = json.Unmarshal(payloadBytes, &msg)
 			payload = msg
 		default:

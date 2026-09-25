@@ -11,10 +11,12 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/yoyo/gotunnel/internal/config"
 	"github.com/yoyo/gotunnel/internal/protocol"
+	"github.com/yoyo/gotunnel/internal/systemmetrics"
 	"github.com/yoyo/gotunnel/internal/tunnel"
 )
 
@@ -36,7 +38,8 @@ type Client struct {
 	password          string
 	reconnectInterval time.Duration
 
-	conn net.Conn
+	conn    net.Conn
+	writeMu sync.Mutex
 
 	// Streams
 	streams   map[uint32]*tunnel.Stream
@@ -50,10 +53,14 @@ type Client struct {
 	doneCh   chan struct{}
 	stopOnce sync.Once
 
-	connected bool
-	connMu    sync.Mutex
-	dialSlots chan struct{}
-	tlsConfig *tls.Config
+	connected     bool
+	connMu        sync.Mutex
+	dialSlots     chan struct{}
+	tlsConfig     *tls.Config
+	startedAt     time.Time
+	metrics       systemmetrics.Collector
+	uploadBytes   atomic.Uint64
+	downloadBytes atomic.Uint64
 }
 
 // EnableTLS enables verified TLS for the control connection. caFile may be
@@ -94,6 +101,7 @@ func NewClient(serverAddr, machineID, password string) *Client {
 		stopCh:            make(chan struct{}),
 		doneCh:            make(chan struct{}),
 		dialSlots:         make(chan struct{}, MaxConcurrentLocalConns),
+		startedAt:         time.Now(),
 	}
 }
 
@@ -343,11 +351,39 @@ func (c *Client) handleMessages() {
 			}
 		}
 	}()
+	telemetryTicker := time.NewTicker(5 * time.Second)
+	defer telemetryTicker.Stop()
+	var previousUpload, previousDownload uint64
+	previousAt := time.Now()
 
 	for {
 		select {
 		case <-c.stopCh:
 			return
+
+		case now := <-telemetryTicker.C:
+			upload := c.uploadBytes.Load()
+			download := c.downloadBytes.Load()
+			elapsed := now.Sub(previousAt).Seconds()
+			c.streamsMu.RLock()
+			activeStreams := len(c.streams)
+			c.streamsMu.RUnlock()
+			host := c.metrics.Collect()
+			telemetry := protocol.MessageTelemetry{
+				Version: config.Version, Timestamp: systemmetrics.UnixTimeMillis(), UptimeSeconds: int64(time.Since(c.startedAt).Seconds()),
+				CPUPercent: host.CPUPercent, ProcessCPUPercent: host.ProcessCPUPercent,
+				MemoryUsedBytes: host.MemoryUsedBytes, MemoryTotalBytes: host.MemoryTotalBytes,
+				ProcessRSSBytes: host.ProcessRSSBytes, Goroutines: host.Goroutines, ActiveStreams: activeStreams,
+				UploadBytes: upload, DownloadBytes: download,
+			}
+			if elapsed > 0 {
+				telemetry.UploadBytesPerSec = float64(upload-previousUpload) / elapsed
+				telemetry.DownloadBytesPerSec = float64(download-previousDownload) / elapsed
+			}
+			if err := c.sendMessageOn(controlConn, &protocol.Message{Type: protocol.MessageTypeTelemetry, Payload: telemetry}); err != nil {
+				return
+			}
+			previousUpload, previousDownload, previousAt = upload, download, now
 
 		case err := <-errCh:
 			if err != io.EOF {
@@ -553,6 +589,7 @@ func (c *Client) handleStreamData(controlConn net.Conn, streamID uint32, stream 
 
 			n, err := conn.Read(buf)
 			if n > 0 {
+				c.uploadBytes.Add(uint64(n))
 				dataMsg := &protocol.Message{Type: protocol.MessageTypeStreamData, Payload: protocol.MessageStreamData{StreamID: streamID, Data: buf[:n]}}
 				if sendErr := c.sendMessageOn(controlConn, dataMsg); sendErr != nil {
 					log.Printf("Stream %d send error: %v", streamID, sendErr)
@@ -599,6 +636,7 @@ func (c *Client) handleStreamData(controlConn net.Conn, streamID uint32, stream 
 
 // handleIncomingStreamData handles data received from server for a stream
 func (c *Client) handleIncomingStreamData(payload protocol.MessageStreamData) {
+	c.downloadBytes.Add(uint64(len(payload.Data)))
 	c.streamsMu.RLock()
 	stream, exists := c.streams[payload.StreamID]
 	c.streamsMu.RUnlock()
@@ -685,6 +723,8 @@ func (c *Client) sendMessageOn(conn net.Conn, msg *protocol.Message) error {
 		return err
 	}
 
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
 	if err := conn.SetWriteDeadline(time.Now().Add(WriteTimeoutDuration)); err != nil {
 		return err
 	}

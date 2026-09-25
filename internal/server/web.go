@@ -11,12 +11,13 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"runtime"
 	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/yoyo/gotunnel/internal/config"
 )
 
 // Logging constants
@@ -327,6 +328,18 @@ func (ws *WebServer) Start(s *Server) error {
 			return
 		}
 		w.Header().Set("Content-Type", "application/javascript")
+		w.Header().Set("Cache-Control", "no-store")
+		w.Write(data)
+	})
+
+	mux.HandleFunc("/theme.js", func(w http.ResponseWriter, r *http.Request) {
+		data, err := fs.ReadFile(webDist, "theme.js")
+		if err != nil {
+			http.Error(w, "Not Found", http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "application/javascript")
+		w.Header().Set("Cache-Control", "no-store")
 		w.Write(data)
 	})
 
@@ -342,6 +355,7 @@ func (ws *WebServer) Start(s *Server) error {
 			return
 		}
 		w.Header().Set("Content-Type", "application/javascript")
+		w.Header().Set("Cache-Control", "no-store")
 		w.Write(data)
 	})
 
@@ -352,6 +366,7 @@ func (ws *WebServer) Start(s *Server) error {
 			return
 		}
 		w.Header().Set("Content-Type", "text/css")
+		w.Header().Set("Cache-Control", "no-store")
 		w.Write(data)
 	})
 
@@ -363,6 +378,7 @@ func (ws *WebServer) Start(s *Server) error {
 			return
 		}
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.Header().Set("Cache-Control", "no-store")
 		w.Write(data)
 	})
 
@@ -383,6 +399,7 @@ func (ws *WebServer) Start(s *Server) error {
 			return
 		}
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.Header().Set("Cache-Control", "no-store")
 		w.Write(data)
 	})
 
@@ -775,10 +792,23 @@ func (ws *WebServer) handleStatus(w http.ResponseWriter, r *http.Request, s *Ser
 		clientConn.streamsMu.RLock()
 		streamCount := len(clientConn.streams)
 		clientConn.streamsMu.RUnlock()
+		clientConn.telemetryMu.RLock()
+		telemetry := clientConn.telemetry
+		telemetryReceivedAt := clientConn.telemetryReceivedAt
+		clientConn.telemetryMu.RUnlock()
+		telemetryAge := int64(0)
+		telemetryStale := telemetryReceivedAt.IsZero()
+		if !telemetryReceivedAt.IsZero() {
+			telemetryAge = time.Since(telemetryReceivedAt).Milliseconds()
+			telemetryStale = telemetryAge > int64((15*time.Second)/time.Millisecond)
+		}
 
 		clients[machineID] = map[string]interface{}{
-			"tunnels": tunnels,
-			"streams": make([]interface{}, streamCount),
+			"tunnels":          tunnels,
+			"streams":          make([]interface{}, streamCount),
+			"telemetry":        telemetry,
+			"telemetry_age_ms": telemetryAge,
+			"telemetry_stale":  telemetryStale,
 		}
 	}
 	s.clientsMu.RUnlock()
@@ -815,18 +845,29 @@ func (ws *WebServer) handleStatus(w http.ResponseWriter, r *http.Request, s *Ser
 			allTunnels[j].(map[string]interface{})["remote"].(int)
 	})
 
-	var memory runtime.MemStats
-	runtime.ReadMemStats(&memory)
+	host := s.metrics.Collect()
+	upload, download, uploadRate, downloadRate := s.trafficSnapshot()
+	serverCfg := s.cfgMgr.GetServerConfig()
 	status := map[string]interface{}{
 		"clients": clients,
 		"tunnels": allTunnels,
+		"version": config.Version,
 		"metrics": map[string]interface{}{
-			"uptime_seconds":     int64(time.Since(s.startedAt).Seconds()),
-			"goroutines":         runtime.NumGoroutine(),
-			"memory_alloc_bytes": memory.Alloc,
-			"active_clients":     len(clients),
-			"active_tunnels":     len(allTunnels),
-			"dropped_logs":       ws.logger.Dropped(),
+			"uptime_seconds":         int64(time.Since(s.startedAt).Seconds()),
+			"cpu_percent":            host.CPUPercent,
+			"process_cpu_percent":    host.ProcessCPUPercent,
+			"memory_used_bytes":      host.MemoryUsedBytes,
+			"memory_total_bytes":     host.MemoryTotalBytes,
+			"process_rss_bytes":      host.ProcessRSSBytes,
+			"goroutines":             host.Goroutines,
+			"active_clients":         len(clients),
+			"active_tunnels":         len(allTunnels),
+			"dropped_logs":           ws.logger.Dropped(),
+			"upload_bytes":           upload,
+			"download_bytes":         download,
+			"upload_bytes_per_sec":   uploadRate,
+			"download_bytes_per_sec": downloadRate,
+			"server_port":            serverCfg.Port,
 		},
 	}
 

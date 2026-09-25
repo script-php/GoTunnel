@@ -9,11 +9,13 @@ import (
 	"net"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
 	"github.com/yoyo/gotunnel/internal/auth"
 	"github.com/yoyo/gotunnel/internal/config"
+	"github.com/yoyo/gotunnel/internal/systemmetrics"
 )
 
 // Resource limits to prevent DoS attacks
@@ -54,14 +56,21 @@ type Server struct {
 	tunnelListeners   map[int]net.Listener
 	tunnelListenersMu sync.Mutex
 
-	stopCh       chan struct{}
-	doneCh       chan struct{}
-	shuttingDown bool
-	shutdownMu   sync.Mutex
-	stopOnce     sync.Once
-	stopErr      error
-	startedAt    time.Time
-	tlsConfig    *tls.Config
+	stopCh        chan struct{}
+	doneCh        chan struct{}
+	shuttingDown  bool
+	shutdownMu    sync.Mutex
+	stopOnce      sync.Once
+	stopErr       error
+	startedAt     time.Time
+	tlsConfig     *tls.Config
+	metrics       systemmetrics.Collector
+	uploadBytes   atomic.Uint64
+	downloadBytes atomic.Uint64
+	trafficMu     sync.Mutex
+	lastTrafficAt time.Time
+	lastUpload    uint64
+	lastDownload  uint64
 }
 
 // LoggerInterface defines logging methods
@@ -82,7 +91,23 @@ func NewServer(cfgMgr *config.Manager) *Server {
 		stopCh:          make(chan struct{}),
 		doneCh:          make(chan struct{}),
 		startedAt:       time.Now(),
+		lastTrafficAt:   time.Now(),
 	}
+}
+
+func (s *Server) trafficSnapshot() (upload, download uint64, uploadRate, downloadRate float64) {
+	upload = s.uploadBytes.Load()
+	download = s.downloadBytes.Load()
+	now := time.Now()
+	s.trafficMu.Lock()
+	elapsed := now.Sub(s.lastTrafficAt).Seconds()
+	if elapsed > 0 {
+		uploadRate = float64(upload-s.lastUpload) / elapsed
+		downloadRate = float64(download-s.lastDownload) / elapsed
+	}
+	s.lastUpload, s.lastDownload, s.lastTrafficAt = upload, download, now
+	s.trafficMu.Unlock()
+	return
 }
 
 // EnableTLS configures encrypted client transport using a certificate pair.
