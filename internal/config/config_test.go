@@ -51,3 +51,44 @@ func TestGettersReturnDeepCopies(t *testing.T) {
 		t.Fatalf("stored local port mutated through caller: got %d", local)
 	}
 }
+
+func TestAddTunnelRejectsDuplicateRemotePort(t *testing.T) {
+	m := NewManager("")
+	m.InitDefault()
+	if err := m.AddTunnelPorts("one", 8000, 80); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.AddTunnelPorts("two", 8000, 81); err == nil || !strings.Contains(err.Error(), "duplicate remote port") {
+		t.Fatalf("AddTunnelPorts() error = %v, want duplicate remote port", err)
+	}
+	if got := m.GetMachine("two"); got != nil {
+		t.Fatalf("rejected machine was stored: %#v", got)
+	}
+}
+
+func TestAddTunnelRollsBackWhenSaveFails(t *testing.T) {
+	path := t.TempDir() // Renaming a file over this directory must fail.
+	m := NewManager(path)
+	m.InitDefault()
+	if err := m.AddTunnelPorts("machine", 8000, 80); err == nil {
+		t.Fatal("AddTunnelPorts() unexpectedly succeeded")
+	}
+	if got := m.GetMachine("machine"); got != nil {
+		t.Fatalf("failed addition remained in memory: %#v", got)
+	}
+}
+
+func TestSavedConfigUsesPrivatePermissions(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	m := NewManager(path)
+	if err := m.Load(); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := info.Mode().Perm(); got != 0600 {
+		t.Fatalf("config permissions = %o, want 600", got)
+	}
+}

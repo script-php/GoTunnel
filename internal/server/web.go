@@ -53,9 +53,11 @@ type Logger struct {
 	filePath string
 
 	// Buffered file writing
-	logCh   chan LogEntry
-	doneCh  chan struct{}
-	fileHdl *os.File
+	logCh     chan LogEntry
+	doneCh    chan struct{}
+	fileHdl   *os.File
+	closeOnce sync.Once
+	closed    bool
 }
 
 // NewLogger creates a new logger with buffered file writes
@@ -153,13 +155,15 @@ func (l *Logger) Add(level, message string) {
 
 	// Add to in-memory buffer
 	l.mu.Lock()
+	if l.closed {
+		l.mu.Unlock()
+		return
+	}
 	l.entries = append(l.entries, entry)
 	if len(l.entries) > l.maxSize {
 		l.entries = l.entries[1:]
 	}
-	l.mu.Unlock()
-
-	// Send to file writer if channel exists (non-blocking)
+	// Send while holding the state lock so Close cannot close the channel here.
 	if l.filePath != "" {
 		select {
 		case l.logCh <- entry:
@@ -167,14 +171,22 @@ func (l *Logger) Add(level, message string) {
 			// Channel full, drop message to prevent blocking
 		}
 	}
+	l.mu.Unlock()
 }
 
 // Close closes the logger and flushes remaining logs
 func (l *Logger) Close() error {
-	if l.filePath != "" {
-		close(l.logCh)
-		<-l.doneCh
-	}
+	l.closeOnce.Do(func() {
+		l.mu.Lock()
+		l.closed = true
+		if l.filePath != "" {
+			close(l.logCh)
+		}
+		l.mu.Unlock()
+		if l.filePath != "" {
+			<-l.doneCh
+		}
+	})
 	return nil
 }
 
@@ -734,7 +746,7 @@ func (s *Server) StartWebPanel(panelPort int) error {
 
 	// Set the server's logger to the web server's logger
 	s.SetLogger(ws.logger)
-
+	s.webServer = ws
 	return ws.Start(s)
 }
 
@@ -802,18 +814,23 @@ func (ws *WebServer) handleAddTunnel(w http.ResponseWriter, r *http.Request, s *
 		return
 	}
 
-	// Add tunnel to config
+	// Persist first so ownership validation is authoritative. Roll it back if
+	// the listener cannot be created.
 	if err := s.cfgMgr.AddTunnelPorts(clientId, req.Remote, req.Local); err != nil {
 		w.WriteHeader(http.StatusBadRequest)
 		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 		return
 	}
 
-	// Register port mapping and start listener
-	s.RegisterPortMapping(req.Remote, clientId)
 	if err := s.StartTunnelListener(req.Remote); err != nil {
-		log.Printf("Warning: failed to start listener for port %d: %v", req.Remote, err)
+		if rollbackErr := s.cfgMgr.RemoveTunnel(clientId, req.Remote); rollbackErr != nil {
+			log.Printf("Failed to roll back tunnel %d after listener error: %v", req.Remote, rollbackErr)
+		}
+		w.WriteHeader(http.StatusConflict)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
 	}
+	s.RegisterPortMapping(req.Remote, clientId)
 
 	w.WriteHeader(http.StatusCreated)
 	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
@@ -842,15 +859,38 @@ func (ws *WebServer) handleRemoveTunnel(w http.ResponseWriter, r *http.Request, 
 		return
 	}
 
-	// Remove tunnel from config
+	machine := s.cfgMgr.GetMachine(clientId)
+	if machine == nil {
+		w.WriteHeader(http.StatusNotFound)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Machine configuration not found"})
+		return
+	}
+	found := false
+	for _, tunnel := range machine.Tunnels {
+		if tunnel.Remote == port {
+			found = true
+			break
+		}
+	}
+	if !found {
+		w.WriteHeader(http.StatusNotFound)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Tunnel not found"})
+		return
+	}
+
+	if err := s.StopTunnelListener(remotePort); err != nil {
+		w.WriteHeader(http.StatusConflict)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
 	if err := s.cfgMgr.RemoveTunnel(clientId, port); err != nil {
+		if restartErr := s.StartTunnelListener(port); restartErr == nil {
+			s.RegisterPortMapping(port, clientId)
+		}
 		w.WriteHeader(http.StatusBadRequest)
 		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 		return
 	}
-
-	// Stop tunnel listener
-	s.StopTunnelListener(remotePort)
 
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})

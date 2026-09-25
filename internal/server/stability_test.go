@@ -1,6 +1,7 @@
 package server
 
 import (
+	"github.com/yoyo/gotunnel/internal/config"
 	"github.com/yoyo/gotunnel/internal/protocol"
 	"github.com/yoyo/gotunnel/internal/tunnel"
 	"net"
@@ -64,5 +65,81 @@ func TestClosedTunnelListenerExits(t *testing.T) {
 	s.acceptTunnelConnections(1234, listener)
 	if listener.calls != 1 {
 		t.Fatalf("Accept called %d times", listener.calls)
+	}
+}
+
+func newTunnelTestServer(t *testing.T) *Server {
+	t.Helper()
+	cfg := config.NewManager("")
+	cfg.InitDefault()
+	if err := cfg.AddTunnelPorts("machine", 8000, 80); err != nil {
+		t.Fatal(err)
+	}
+	return NewServer(cfg)
+}
+
+func TestStreamIsRemovedWhenOpenMessageFails(t *testing.T) {
+	s := newTunnelTestServer(t)
+	control, controlPeer := net.Pipe()
+	controlPeer.Close()
+	cc := NewClientConnection(control, s)
+	cc.MachineID = "machine"
+	external, externalPeer := net.Pipe()
+	defer externalPeer.Close()
+
+	cc.HandleIncomingConnection(8000, external)
+	cc.streamsMu.RLock()
+	count := len(cc.streams)
+	cc.streamsMu.RUnlock()
+	if count != 0 {
+		t.Fatalf("failed stream remains registered: %d streams", count)
+	}
+}
+
+func TestStreamLimitIsEnforcedDuringReservation(t *testing.T) {
+	s := newTunnelTestServer(t)
+	control, controlPeer := net.Pipe()
+	defer control.Close()
+	defer controlPeer.Close()
+	cc := NewClientConnection(control, s)
+	cc.MachineID = "machine"
+	for i := uint32(1); i <= MaxStreamsPerClient; i++ {
+		cc.streams[i] = tunnel.NewStream(i, nil, nil)
+	}
+	external, externalPeer := net.Pipe()
+	defer externalPeer.Close()
+
+	cc.HandleIncomingConnection(8000, external)
+	cc.streamsMu.RLock()
+	count := len(cc.streams)
+	cc.streamsMu.RUnlock()
+	if count != MaxStreamsPerClient {
+		t.Fatalf("stream count = %d, want %d", count, MaxStreamsPerClient)
+	}
+}
+
+func TestServerStopIsIdempotent(t *testing.T) {
+	s := newTunnelTestServer(t)
+	close(s.doneCh) // Simulate an accept loop that has already exited.
+	if err := s.Stop(); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Stop(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestLoggerCloseIsIdempotent(t *testing.T) {
+	l := NewLogger("", 10)
+	l.Add("INFO", "before close")
+	if err := l.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := l.Close(); err != nil {
+		t.Fatal(err)
+	}
+	l.Add("INFO", "after close")
+	if got := l.Count(); got != 1 {
+		t.Fatalf("log count after close = %d, want 1", got)
 	}
 }

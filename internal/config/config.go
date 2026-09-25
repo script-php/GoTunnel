@@ -3,7 +3,6 @@ package config
 import (
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"sync"
@@ -65,7 +64,7 @@ func (m *Manager) Load() error {
 	}
 
 	// File exists, load it
-	data, err := ioutil.ReadFile(m.path)
+	data, err := os.ReadFile(m.path)
 	if err != nil {
 		return fmt.Errorf("failed to read config file: %w", err)
 	}
@@ -115,18 +114,45 @@ func (m *Manager) saveLocked() error {
 		return fmt.Errorf("failed to create config directory: %w", err)
 	}
 
-	// Write to temp file first
-	tmpPath := m.path + ".tmp"
-	if err := ioutil.WriteFile(tmpPath, data, 0644); err != nil {
+	// Create the temporary file in the same directory so rename is atomic.
+	tmp, err := os.CreateTemp(dir, ".gotunnel-config-*")
+	if err != nil {
+		return fmt.Errorf("failed to create temp config file: %w", err)
+	}
+	tmpPath := tmp.Name()
+	committed := false
+	defer func() {
+		tmp.Close()
+		if !committed {
+			os.Remove(tmpPath)
+		}
+	}()
+	if err := tmp.Chmod(0600); err != nil {
+		return fmt.Errorf("failed to protect temp config file: %w", err)
+	}
+	if _, err := tmp.Write(data); err != nil {
 		return fmt.Errorf("failed to write temp config file: %w", err)
 	}
-
-	// Atomic rename
+	if err := tmp.Sync(); err != nil {
+		return fmt.Errorf("failed to sync temp config file: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("failed to close temp config file: %w", err)
+	}
 	if err := os.Rename(tmpPath, m.path); err != nil {
-		os.Remove(tmpPath) // cleanup temp file
 		return fmt.Errorf("failed to save config file: %w", err)
 	}
+	committed = true
 
+	// Sync the directory entry so the rename survives an abrupt power loss.
+	dirHandle, err := os.Open(dir)
+	if err != nil {
+		return fmt.Errorf("failed to open config directory for sync: %w", err)
+	}
+	defer dirHandle.Close()
+	if err := dirHandle.Sync(); err != nil {
+		return fmt.Errorf("failed to sync config directory: %w", err)
+	}
 	return nil
 }
 
@@ -191,11 +217,21 @@ func (m *Manager) AddOrUpdateMachine(machineID string, machine *MachineConfig) e
 	if machineID == "" {
 		return fmt.Errorf("machine ID cannot be empty")
 	}
-	if err := validateMachine(machineID, *machine, m.cfg.Server, nil); err != nil {
+	owners := m.remotePortOwners(machineID)
+	if err := validateMachine(machineID, *machine, m.cfg.Server, owners); err != nil {
 		return err
 	}
+	previous, existed := m.cfg.Machines[machineID]
 	m.cfg.Machines[machineID] = cloneMachine(*machine)
-	return m.saveLocked()
+	if err := m.saveLocked(); err != nil {
+		if existed {
+			m.cfg.Machines[machineID] = previous
+		} else {
+			delete(m.cfg.Machines, machineID)
+		}
+		return err
+	}
+	return nil
 }
 
 // GetAllMachines returns all machine configurations
@@ -228,9 +264,22 @@ func (m *Manager) AddTunnel(machineID string, tunnel TunnelConfig) error {
 		machine = MachineConfig{Tunnels: []TunnelConfig{}}
 	}
 
+	owners := m.remotePortOwners("")
+	if err := validateMachine(machineID, MachineConfig{Tunnels: []TunnelConfig{tunnel}}, m.cfg.Server, owners); err != nil {
+		return err
+	}
+	previous := cloneMachine(machine)
 	machine.Tunnels = append(machine.Tunnels, tunnel)
 	m.cfg.Machines[machineID] = machine
-	return m.saveLocked()
+	if err := m.saveLocked(); err != nil {
+		if exists {
+			m.cfg.Machines[machineID] = previous
+		} else {
+			delete(m.cfg.Machines, machineID)
+		}
+		return err
+	}
+	return nil
 }
 
 // AddTunnelPorts adds a tunnel configuration to a machine using port values directly
@@ -252,16 +301,27 @@ func (m *Manager) RemoveTunnel(machineID string, remotePort int) error {
 		return fmt.Errorf("machine not found")
 	}
 
-	var newTunnels []TunnelConfig
+	previous := cloneMachine(machine)
+	newTunnels := make([]TunnelConfig, 0, len(machine.Tunnels))
+	found := false
 	for _, t := range machine.Tunnels {
 		if t.Remote != remotePort {
 			newTunnels = append(newTunnels, t)
+		} else {
+			found = true
 		}
+	}
+	if !found {
+		return fmt.Errorf("tunnel on remote port %d not found", remotePort)
 	}
 
 	machine.Tunnels = newTunnels
 	m.cfg.Machines[machineID] = machine
-	return m.saveLocked()
+	if err := m.saveLocked(); err != nil {
+		m.cfg.Machines[machineID] = previous
+		return err
+	}
+	return nil
 }
 
 // getDefaultConfig returns a default configuration
@@ -365,4 +425,17 @@ func validateMachine(id string, machine MachineConfig, server ServerConfig, owne
 		}
 	}
 	return nil
+}
+
+func (m *Manager) remotePortOwners(excludeMachine string) map[int]string {
+	owners := make(map[int]string)
+	for id, machine := range m.cfg.Machines {
+		if id == excludeMachine {
+			continue
+		}
+		for _, tunnel := range machine.Tunnels {
+			owners[tunnel.Remote] = id
+		}
+	}
+	return owners
 }

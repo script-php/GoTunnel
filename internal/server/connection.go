@@ -336,8 +336,6 @@ func (cc *ClientConnection) Handle() {
 			}
 		}
 	}
-
-	cc.Close()
 }
 
 // HandleIncomingConnection handles an incoming tunnel connection
@@ -400,7 +398,6 @@ func (cc *ClientConnection) HandleIncomingConnection(port int, conn net.Conn) {
 		cc.closeStream(streamID)
 		return
 	}
-
 
 	log.Printf("Stream %d opened for port %d (local: %d)", streamID, port, localPort)
 	if cc.server.logger != nil {

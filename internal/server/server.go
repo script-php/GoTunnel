@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"net/http"
 	"sync"
 	"syscall"
 	"time"
@@ -29,6 +30,7 @@ type Server struct {
 	cfgMgr        *config.Manager
 	authenticator *auth.Authenticator
 	logger        LoggerInterface
+	webServer     *WebServer
 
 	// Clients
 	clients   map[string]*ClientConnection
@@ -42,6 +44,7 @@ type Server struct {
 	connCount   int32 // Total active connections
 	connCountMu sync.Mutex
 	pendingAuth chan struct{}
+	clientWG    sync.WaitGroup
 
 	// Listener for client connections
 	listener net.Listener
@@ -54,6 +57,8 @@ type Server struct {
 	doneCh       chan struct{}
 	shuttingDown bool
 	shutdownMu   sync.Mutex
+	stopOnce     sync.Once
+	stopErr      error
 }
 
 // LoggerInterface defines logging methods
@@ -143,32 +148,43 @@ func (s *Server) Start() error {
 
 // Stop stops the server
 func (s *Server) Stop() error {
-	s.shutdownMu.Lock()
-	s.shuttingDown = true
-	s.shutdownMu.Unlock()
+	s.stopOnce.Do(func() {
+		s.shutdownMu.Lock()
+		s.shuttingDown = true
+		s.shutdownMu.Unlock()
 
-	close(s.stopCh)
+		close(s.stopCh)
+		if s.listener != nil {
+			s.listener.Close()
+		}
+		<-s.doneCh
 
-	if s.listener != nil {
-		s.listener.Close()
-	}
+		s.tunnelListenersMu.Lock()
+		for _, listener := range s.tunnelListeners {
+			listener.Close()
+		}
+		s.tunnelListenersMu.Unlock()
 
-	// Close all tunnel listeners
-	s.tunnelListenersMu.Lock()
-	for _, listener := range s.tunnelListeners {
-		listener.Close()
-	}
-	s.tunnelListenersMu.Unlock()
+		if s.webServer != nil {
+			if err := s.webServer.Stop(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				s.stopErr = err
+			}
+		}
 
-	// Close all client connections
-	s.clientsMu.Lock()
-	for _, client := range s.clients {
-		client.Close()
-	}
-	s.clientsMu.Unlock()
+		s.clientsMu.Lock()
+		for _, client := range s.clients {
+			client.Close()
+		}
+		s.clientsMu.Unlock()
+		s.clientWG.Wait()
 
-	<-s.doneCh
-	return nil
+		if s.webServer != nil {
+			if err := s.webServer.logger.Close(); err != nil && s.stopErr == nil {
+				s.stopErr = err
+			}
+		}
+	})
+	return s.stopErr
 }
 
 // acceptClients accepts incoming client connections
@@ -195,7 +211,9 @@ func (s *Server) acceptClients() {
 
 		select {
 		case s.pendingAuth <- struct{}{}:
+			s.clientWG.Add(1)
 			go func() {
+				defer s.clientWG.Done()
 				defer func() { <-s.pendingAuth }()
 				s.handleClientConnection(conn)
 			}()

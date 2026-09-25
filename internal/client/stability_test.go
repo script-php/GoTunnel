@@ -44,3 +44,16 @@ func TestSetReconnectInterval(t *testing.T) {
 		t.Fatal("accepted zero reconnect interval")
 	}
 }
+
+func TestStopIsIdempotent(t *testing.T) {
+	c := NewClient("127.0.0.1:1", "machine", "password")
+	if err := c.Start(); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Stop(); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Stop(); err != nil {
+		t.Fatal(err)
+	}
+}

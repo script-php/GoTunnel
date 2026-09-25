@@ -41,8 +41,9 @@ type Client struct {
 	tunnels   []protocol.TunnelMap
 	tunnelsMu sync.RWMutex
 
-	stopCh chan struct{}
-	doneCh chan struct{}
+	stopCh   chan struct{}
+	doneCh   chan struct{}
+	stopOnce sync.Once
 
 	connected bool
 	connMu    sync.Mutex
@@ -83,8 +84,10 @@ func (c *Client) Start() error {
 
 // Stop stops the client
 func (c *Client) Stop() error {
-	close(c.stopCh)
-	c.closeConnection()
+	c.stopOnce.Do(func() {
+		close(c.stopCh)
+		c.closeConnection()
+	})
 	<-c.doneCh
 	return nil
 }
